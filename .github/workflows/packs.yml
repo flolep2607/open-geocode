@@ -1,0 +1,87 @@
+name: packs
+
+# Builds one Pack per country from its Geofabrik extract with the published image, and uploads it
+# to the rolling `packs-latest` release. Packs are built from OpenStreetMap data and published under
+# the ODbL: (c) OpenStreetMap contributors, https://www.openstreetmap.org/copyright.
+on:
+  schedule:
+    - cron: "0 3 * * 1"  # Mondays 03:00 UTC: Geofabrik extracts are daily
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: "Comma-separated Geofabrik paths (default: all)"
+        required: false
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      countries: ${{ steps.pick.outputs.countries }}
+    steps:
+      - id: pick
+        run: |
+          all='["australia-oceania/new-zealand","australia-oceania/australia","north-america/canada"]'
+          if [ -n "${{ inputs.countries }}" ]; then
+            all=$(echo '${{ inputs.countries }}' | jq -Rc 'split(",") | map(gsub("^ +| +$"; ""))')
+          fi
+          echo "countries=$all" >> "$GITHUB_OUTPUT"
+
+  pack:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        region: ${{ fromJson(needs.plan.outputs.countries) }}
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download and verify the extract
+        run: |
+          name=$(basename "${{ matrix.region }}")
+          url="https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf"
+          mkdir -p work && cd work
+          curl -fsSL --retry 5 -o "$name.osm.pbf" "$url"
+          want=$(curl -fsSL "$url.md5" | awk '{print $1}')
+          got=$(md5sum "$name.osm.pbf" | awk '{print $1}')
+          test "$want" = "$got" || { echo "checksum mismatch: $want != $got"; exit 1; }
+          echo "NAME=$name" >> "$GITHUB_ENV"
+          ls -la
+      - name: Build the pack
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/work:/work" ghcr.io/${{ github.repository_owner }}/open-geocode:latest \
+            build --input "/work/$NAME.osm.pbf" --pack "/work/pack-$NAME" --memory-budget-mb 8192
+          rm "work/$NAME.osm.pbf"
+          pack=$(find "work/pack-$NAME/generations" -name pack.ogp | head -1)
+          mv "$pack" "work/$NAME.ogp"
+          ls -la work
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view packs-latest >/dev/null 2>&1 || gh release create packs-latest --title "Packs (latest)" \
+            --notes "Weekly open-geocode Packs built from Geofabrik extracts. Data (c) OpenStreetMap contributors, ODbL 1.0: https://www.openstreetmap.org/copyright. Large packs are split into .partNN files; join them with cat."
+          cd work
+          size=$(stat -c %s "$NAME.ogp")
+          gh release delete-asset packs-latest "$NAME.ogp" -y 2>/dev/null || true
+          for old in $(gh release view packs-latest --json assets -q ".assets[].name" | grep "^$NAME.ogp.part"); do gh release delete-asset packs-latest "$old" -y; done
+          if [ "$size" -gt 1900000000 ]; then
+            split -b 1900m -d -a 2 "$NAME.ogp" "$NAME.ogp.part"
+            gh release upload packs-latest "$NAME".ogp.part* --clobber
+          else
+            gh release upload packs-latest "$NAME.ogp" --clobber
+          fi
