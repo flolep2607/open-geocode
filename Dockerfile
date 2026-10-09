@@ -1,7 +1,19 @@
 # open-geocode server image: the release binary on a slim base. Packs are mounted, not baked in:
-#   docker run -v /srv/packs/au:/packs/pack -p 8080:8080 ghcr.io/flolep2607/open-geocode:latest
-FROM rust:1-bookworm AS build
+#   docker run -v /srv/packs:/packs -p 8080:8080 ghcr.io/flolep2607/open-geocode:latest serve --pack /packs/australia.ogp
+#
+# cargo-chef splits the build: dependencies compile in their own layer, keyed on the lockfile only,
+# so a source change recompiles open-geocode alone and the dependency layer comes from the cache.
+FROM rust:1-bookworm AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --locked && strip target/release/open-geocode
 
