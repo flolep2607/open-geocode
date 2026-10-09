@@ -85,6 +85,8 @@ struct GeocodeParams {
     #[serde(default)]
     limit: usize,
     layer: Option<String>,
+    #[serde(default)]
+    street_fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +318,7 @@ async fn geocode(
         postcode,
         limit: params.limit,
         layer: params.layer,
+        street_fallback: params.street_fallback,
     };
     let searcher = Arc::clone(&state.searcher);
     let hit = task::spawn_blocking(move || searcher.geocode_address(options))
