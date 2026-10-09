@@ -261,6 +261,15 @@ async fn reverse(
     forward_or_merge(&state, "/reverse", None, raw, request_id).await
 }
 
+/// `/geocode` answers with one best match, so like `/reverse` it needs `country`.
+async fn geocode(
+    State(state): State<RouteState>,
+    request_id: Option<Extension<RequestId>>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    forward_or_merge(&state, "/geocode", None, raw, request_id).await
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::OK
 }
@@ -296,6 +305,7 @@ fn build_router(state: RouteState) -> Router {
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
         .route("/reverse", get_only(reverse))
+        .route("/geocode", get_only(geocode))
         .route("/healthz", get_only(healthz))
         .route("/readyz", get_only(readyz))
         .method_not_allowed_fallback(method::method_not_allowed)
@@ -410,6 +420,10 @@ mod tests {
         assert_eq!(body["error_code"], "unknown_country");
 
         let (status, body) = get(&format!("{base}/reverse?lon=1&lat=2")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], "country_required");
+
+        let (status, body) = get(&format!("{base}/geocode?address=1+King+St")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error_code"], "country_required");
     }
