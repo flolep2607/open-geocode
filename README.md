@@ -42,6 +42,10 @@ Building the Ontario pack (~940 MB PBF) takes under a minute on a 24-core machin
    cargo run --release -- serve --pack data/pack
    ```
 
+`serve` and `route` log to stderr; set `RUST_LOG` to change the level (default `info`, for example `RUST_LOG=open_geocode=debug,info`).
+On Ctrl-C or SIGTERM both stop accepting connections and exit once the requests in flight have finished; `serve` answers `/readyz` with 503 during that drain.
+`serve --max-concurrency <N>` (default: the number of CPUs) caps the API requests processed at once; a request that waits more than 2 s for a slot gets 503 with `Retry-After: 1`.
+
 ## Building large extracts and the planet
 
 The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so its large buffers stay within `--memory-budget-mb` whatever the input size.

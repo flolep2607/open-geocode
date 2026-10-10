@@ -48,6 +48,9 @@ struct ProblemInner {
     /// Value for the `Allow` response header (405 only); never serialized.
     #[serde(skip)]
     allow: Option<String>,
+    /// Value for the `Retry-After` response header, in seconds; never serialized.
+    #[serde(skip)]
+    retry_after: Option<u32>,
 }
 
 /// An RFC 9457 problem response. Boxed so it stays small in the `Err` position of
@@ -69,6 +72,7 @@ impl Problem {
             error_code: Some(error_code.to_string()),
             invalid_params: Vec::new(),
             allow: None,
+            retry_after: None,
         }))
     }
 
@@ -168,6 +172,17 @@ impl Problem {
             .with_detail(format!("the {country} Runtime did not answer"))
     }
 
+    // --- 503 ---------------------------------------------------------------
+
+    /// Every blocking-pool slot stayed busy past the queue timeout: shed the request rather than
+    /// let the queue grow, and tell the client when to try again.
+    pub(crate) fn overloaded() -> Self {
+        let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, "overloaded")
+            .with_detail("the server is at capacity; retry shortly");
+        problem.0.retry_after = Some(1);
+        problem
+    }
+
     // --- 500 ---------------------------------------------------------------
 
     /// A generic 500. Carries no detail so internal errors never leak.
@@ -185,6 +200,7 @@ impl IntoResponse for Problem {
         let status =
             StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let allow = self.0.allow.clone();
+        let retry_after = self.0.retry_after;
         let body = serde_json::to_vec(&self).unwrap_or_else(|_| b"{}".to_vec());
 
         let mut response = (status, body).into_response();
@@ -196,6 +212,11 @@ impl IntoResponse for Problem {
             && let Ok(value) = HeaderValue::from_str(&allow)
         {
             response.headers_mut().insert(header::ALLOW, value);
+        }
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }
