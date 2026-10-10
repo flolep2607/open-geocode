@@ -99,6 +99,8 @@ impl RouteState {
     async fn get(&self, url: &str, request_id: Option<&str>) -> Option<Upstream> {
         let answer = self.try_get(url, request_id).await;
         if let Err(error) = &answer {
+            // The query string is the searched address; keep it out of the logs.
+            let url = url.split_once('?').map_or(url, |(path, _)| path);
             tracing::warn!(
                 request_id = request_id.unwrap_or("-"),
                 url,
