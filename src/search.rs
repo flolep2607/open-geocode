@@ -112,7 +112,8 @@ impl DesiredContext {
     }
 }
 
-/// Admin ids repeat across hits in one town; per request only, never cross-request/global.
+/// Normalized (label, name) of context records, `None` for other records. Kept
+/// for one geocode request: admin ids repeat across hits in the same town.
 type ContextLabels = HashMap<RecordId, Option<(Option<String>, Option<String>)>>;
 
 impl AddressGeocodeHit {
