@@ -9,6 +9,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency: { group: docker-publish, cancel-in-progress: false }
+
 permissions:
   contents: read
   packages: write
@@ -24,6 +26,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # Older workflow_run jobs can start later; only the current main tip should publish latest.
+      - id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          main=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+          if [ "$main" = "$HEAD_SHA" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
       - id: sha
         run: echo "short=${HEAD_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
@@ -37,7 +50,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/open-geocode
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ steps.tip.outputs.latest == 'true' && github.ref_name == github.event.repository.default_branch }}
             type=raw,value=sha-${{ steps.sha.outputs.short }}
           labels: |
             org.opencontainers.image.revision=${{ env.HEAD_SHA }}
