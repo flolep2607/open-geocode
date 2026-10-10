@@ -1,4 +1,4 @@
-use std::{fs::File, net::SocketAddr, path::PathBuf};
+use std::{fs::File, io::IsTerminal, net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -11,7 +11,7 @@ use open_geocode::{
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     route::{RouteOptions, route},
-    runtime::{ServeOptions, serve},
+    runtime::{ServeOptions, default_max_concurrency, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
 
@@ -179,11 +179,17 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// API requests processed at once (default: the number of CPUs). A request that
+        /// waits more than 2 s for a slot gets 503 with Retry-After.
+        #[arg(long, default_value_t = default_max_concurrency())]
+        max_concurrency: NonZeroUsize,
     },
     /// Serve one HTTP entry point in front of one Runtime per country Pack.
     ///
     /// Requests with `country=XX` go to that country's Runtime; /search and /autocomplete
-    /// without it go to every Runtime and are merged by score.
+    /// without it go to every Runtime and are merged: labels that cover more of the query
+    /// first, then each Runtime's own ranking, interleaved.
     Route {
         /// A Runtime as COUNTRY=URL, e.g. NZ=http://127.0.0.1:8081. Repeat per country.
         #[arg(long = "worker", required = true)]
@@ -339,16 +345,20 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            max_concurrency,
         } => {
+            init_tracing();
             serve(ServeOptions {
                 pack,
                 demo,
                 bind,
                 basemap,
+                max_concurrency: max_concurrency.get(),
             })
             .await
         }
         Commands::Route { workers, bind } => {
+            init_tracing();
             let workers = workers
                 .into_iter()
                 .map(|w| match w.split_once('=') {
@@ -359,6 +369,18 @@ async fn main() -> Result<()> {
             route(RouteOptions { workers, bind }).await
         }
     }
+}
+
+/// Logs for the long-running `serve` and `route`, on stderr, filtered by `RUST_LOG` (default
+/// `info`). The other commands keep their plain stdout output.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
 }
 
 fn inspect_pack(

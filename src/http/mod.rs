@@ -16,3 +16,4 @@ pub(crate) mod health;
 pub(crate) mod method;
 pub(crate) mod problem;
 pub(crate) mod request_id;
+pub(crate) mod shutdown;
