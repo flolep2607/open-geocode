@@ -10,6 +10,8 @@ use axum::{
 };
 use serde::Serialize;
 
+use crate::search::InvalidQuery;
+
 /// One `invalid_params` entry, a safe extension member naming a rejected field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct InvalidParam {
@@ -201,12 +203,11 @@ impl IntoResponse for Problem {
 
 /// Map a search/autocomplete error into a Problem without leaking internals.
 ///
-/// `PackTextSearcher` reports a Tantivy query-parse failure with a message that
-/// contains `"failed to parse search query"`; that is a client error (400).
-/// Everything else is an unexpected runtime failure (500, no detail).
+/// The typed error survives `.context` layers added by callers; rewording
+/// messages can't turn 400s into 500s. Everything else is an unexpected runtime
+/// failure (500, no detail).
 pub(crate) fn classify_search_error(error: anyhow::Error) -> Problem {
-    let details = format!("{error:#}");
-    if details.contains("failed to parse search query") {
+    if error.chain().any(|cause| cause.is::<InvalidQuery>()) {
         Problem::invalid_query("invalid search query")
     } else {
         Problem::internal()
@@ -273,10 +274,21 @@ mod tests {
     }
 
     #[test]
-    fn classify_maps_parse_error_to_400() {
-        let problem = classify_search_error(anyhow::anyhow!("failed to parse search query \"(\""));
+    fn classify_maps_typed_parse_error_to_400_through_context() {
+        let error = anyhow::Error::new(InvalidQuery {
+            message: "failed to parse search query \"(\": ...".into(),
+        })
+        .context("failed to search text index for \"(\"");
+        let problem = classify_search_error(error);
         assert_eq!(problem.status(), 400);
         assert_eq!(problem.error_code(), Some("invalid_query"));
+    }
+
+    #[test]
+    fn classify_does_not_match_error_text() {
+        let problem = classify_search_error(anyhow::anyhow!("failed to parse search query \"(\""));
+        assert_eq!(problem.status(), 500);
+        assert!(problem.detail().is_none());
     }
 
     #[test]
