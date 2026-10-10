@@ -724,12 +724,17 @@ impl RecordsReader {
 
     /// Id, label, layer, point and source without decoding geometry.
     pub fn summary(&self, id: RecordId) -> Result<RecordSummary> {
-        let (header, mut fields) = self.body(id)?;
+        let (header, fields) = self.body(id)?;
+        self.summary_from_body(&header, fields)
+    }
+
+    fn summary_from_body(&self, header: &RecordHeader, fields: &[u8]) -> Result<RecordSummary> {
+        let mut fields = fields;
         let mut source = header.source()?;
         let (record_id, label) = match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
-                let id = match self.imported_dataset(&header, &mut fields)? {
+                let id = match self.imported_dataset(header, &mut fields)? {
                     Some(dataset) => {
                         let provenance = header.provenance(Some(dataset))?;
                         source.dataset = provenance.dataset.clone();
@@ -809,11 +814,11 @@ impl RecordsReader {
 
     /// Context (place or postcode) record view, `None` for other layers.
     pub fn context_record(&self, id: RecordId) -> Result<Option<ContextRecord>> {
-        let header = self.header(id)?;
+        let (header, fields) = self.body(id)?;
         if !header.layer.is_context() {
             return Ok(None);
         }
-        let summary = self.summary(id)?;
+        let summary = self.summary_from_body(&header, fields)?;
         Ok(Some(ContextRecord {
             id: summary.id,
             layer: summary.layer,
@@ -1337,6 +1342,29 @@ mod tests {
                 [-790_015_000, 430_000_000]
             ])
         );
+    }
+
+    #[test]
+    fn context_record_reads_places_and_postcodes_only() {
+        let reader = write_store(&sample_records(), &[]);
+
+        let place = reader
+            .context_record(5)
+            .expect("place context")
+            .expect("place record");
+        assert_eq!(place.layer, "region");
+        assert_eq!(place.label, "Example place");
+        assert_eq!(place.name, "Example place");
+        assert_eq!(place.postcode, None);
+
+        let postcode = reader
+            .context_record(2)
+            .expect("postcode context")
+            .expect("postcode record");
+        assert_eq!(postcode.layer, "postcode");
+        assert_eq!(postcode.postcode.as_deref(), Some("M5V 1A1"));
+
+        assert_eq!(reader.context_record(0).expect("address context"), None);
     }
 
     #[test]

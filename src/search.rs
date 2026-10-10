@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    fmt,
     path::Path,
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use tantivy::{
     Index, IndexReader, Score, Term,
@@ -24,10 +25,25 @@ use crate::{
 pub struct PackTextSearcher {
     pack: Arc<PackReader>,
     spatial: SpatialIndexReader,
-    index: Index,
     reader: IndexReader,
     fields: TextIndexFields,
+    query_parser: QueryParser,
 }
+
+/// A query the text index cannot run: blank, or rejected by the query parser.
+/// A client error, unlike a failure to read the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidQuery {
+    pub message: String,
+}
+
+impl fmt::Display for InvalidQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InvalidQuery {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSearchOptions {
@@ -73,6 +89,33 @@ pub struct AddressGeocodeHit {
     pub hit: TextSearchHit,
 }
 
+/// The region, locality and postcode a hit must match, normalized once per request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DesiredContext {
+    region: Option<String>,
+    locality: Option<String>,
+    postcode: Option<String>,
+}
+
+impl DesiredContext {
+    fn new(options: &AddressGeocodeOptions) -> Self {
+        let (region, locality, postcode) = desired_address_context(options);
+        Self {
+            region,
+            locality,
+            postcode,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.region.is_none() && self.locality.is_none() && self.postcode.is_none()
+    }
+}
+
+/// Normalized (label, name) of context records, `None` for other records. Kept
+/// for one geocode request: admin ids repeat across hits in the same town.
+type ContextLabels = HashMap<RecordId, Option<(Option<String>, Option<String>)>>;
+
 impl AddressGeocodeHit {
     fn new(query: String, hit: TextSearchHit) -> Result<Self> {
         let match_level = Layer::parse(&hit.record.layer)
@@ -114,12 +157,13 @@ impl PackTextSearcher {
         let fields = TextIndexFields::from_schema(&schema)?;
         let reader = index.reader().context("failed to open Tantivy reader")?;
         let spatial = SpatialIndexReader::open(pack.container(), pack.records().clone())?;
+        let query_parser = text_query_parser(&index, &fields);
         Ok(Self {
             spatial,
             pack,
-            index,
             reader,
             fields,
+            query_parser,
         })
     }
 
@@ -131,7 +175,10 @@ impl PackTextSearcher {
 
         let query_text = options.query.trim();
         if query_text.is_empty() {
-            bail!("search query cannot be empty");
+            return Err(InvalidQuery {
+                message: "search query cannot be empty".to_string(),
+            }
+            .into());
         }
 
         let (_, hits) =
@@ -160,8 +207,9 @@ impl PackTextSearcher {
         // better-ranked rejects is still missed. Because the widened window can
         // accept a lower-ranked hit, an earlier query variant now wins over a
         // later rewrite more often than when only `limit` hits were checked.
-        let (region, locality, postcode) = desired_address_context(&options);
-        let window = if region.is_some() || locality.is_some() || postcode.is_some() {
+        let desired = DesiredContext::new(&options);
+        let mut context_labels = ContextLabels::new();
+        let window = if !desired.is_empty() {
             limit.max(MAX_RANK_WINDOW)
         } else {
             limit
@@ -171,14 +219,19 @@ impl PackTextSearcher {
             let (query, hits) =
                 self.search_variants(&candidate, options.layer.as_deref(), window, |hit| {
                     Ok(hit.record.point.is_some()
-                        && self.hit_matches_address_context(hit, &options, false)?)
+                        && self.hit_matches_address_context(
+                            hit,
+                            &desired,
+                            false,
+                            &mut context_labels,
+                        )?)
                 })?;
             if let Some(hit) = hits.into_iter().next() {
                 return AddressGeocodeHit::new(query, hit).map(Some);
             }
         }
 
-        self.geocode_street(address, &options)
+        self.geocode_street(address, &options, &desired, &mut context_labels)
     }
 
     /// The house is not in the data, but its street may be: a point on the
@@ -190,9 +243,11 @@ impl PackTextSearcher {
         &self,
         address: &str,
         options: &AddressGeocodeOptions,
+        desired: &DesiredContext,
+        context_labels: &mut ContextLabels,
     ) -> Result<Option<AddressGeocodeHit>> {
-        let has_locality = normalized_for_match(options.locality.as_deref()).is_some();
-        let has_postcode = normalized_postcode_for_match(options.postcode.as_deref()).is_some();
+        let has_locality = desired.locality.is_some();
+        let has_postcode = desired.postcode.is_some();
         if !options.street_fallback || options.layer.is_some() || !(has_locality || has_postcode) {
             return Ok(None);
         }
@@ -213,7 +268,8 @@ impl PackTextSearcher {
                 {
                     return Ok(false);
                 }
-                found = self.hit_matches_address_context(hit, options, !has_locality)?;
+                found =
+                    self.hit_matches_address_context(hit, desired, !has_locality, context_labels)?;
                 Ok(found)
             },
         )?;
@@ -250,16 +306,12 @@ impl PackTextSearcher {
     }
 
     fn build_query(&self, query_text: &str, layer: Option<&str>) -> Result<Box<dyn Query>> {
-        let mut query_parser = QueryParser::for_index(&self.index, self.search_fields());
-        query_parser.set_conjunction_by_default();
-        query_parser.set_field_boost(self.fields.label_text, 3.0);
-        query_parser.set_field_boost(self.fields.name_text, 2.5);
-        query_parser.set_field_boost(self.fields.address_number, 2.0);
-        query_parser.set_field_boost(self.fields.postcode_exact, 2.0);
-
-        let text_query = query_parser
-            .parse_query(query_text)
-            .with_context(|| format!("failed to parse search query {query_text:?}"))?;
+        let text_query =
+            self.query_parser
+                .parse_query(query_text)
+                .map_err(|error| InvalidQuery {
+                    message: format!("failed to parse search query {query_text:?}: {error}"),
+                })?;
 
         let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) else {
             return Ok(text_query);
@@ -322,65 +374,71 @@ impl PackTextSearcher {
     fn hit_matches_address_context(
         &self,
         hit: &TextSearchHit,
-        options: &AddressGeocodeOptions,
+        desired: &DesiredContext,
         strict_postcode: bool,
+        context_labels: &mut ContextLabels,
     ) -> Result<bool> {
-        let (desired_region, desired_locality, desired_postcode) = desired_address_context(options);
-        if desired_region.is_none() && desired_locality.is_none() && desired_postcode.is_none() {
+        if desired.is_empty() {
             return Ok(true);
         }
 
-        if let Some(desired) = &desired_postcode
-            && !self.hit_in_postcode(hit, desired, strict_postcode)?
+        if let Some(desired_postcode) = desired.postcode.as_deref()
+            && !self.hit_in_postcode(hit, desired_postcode, strict_postcode)?
         {
             return Ok(false);
         }
 
         // The address's own town settles the locality where no boundary carries it:
         // suburbs are not admin_level 8 everywhere, and some countries map none.
-        let desired_locality = match desired_locality {
+        let desired_locality = match desired.locality.as_deref() {
             Some(locality) => {
                 let own = self
                     .pack
                     .address(hit.record_id)?
                     .and_then(|record| normalized_for_match(record.address.locality.as_deref()));
-                (own.as_deref() != Some(locality.as_str())).then_some(locality)
+                (own.as_deref() != Some(locality)).then_some(locality)
             }
             None => None,
         };
 
         let Some(context) = self.pack.boundary_context(hit.record_id)? else {
-            return Ok(desired_region.is_none() && desired_locality.is_none());
+            return Ok(desired.region.is_none() && desired_locality.is_none());
         };
 
-        let mut admin_labels = Vec::new();
-        {
-            let tuple = context.admin_context;
-            for (layer, record_id) in [
-                ("country", tuple.country_record_id),
-                ("region", tuple.region_record_id),
-                ("district", tuple.district_record_id),
-                ("locality", tuple.locality_record_id),
-                ("neighbourhood", tuple.neighbourhood_record_id),
-                ("place", tuple.place_record_id),
-            ] {
-                if let Some(record_id) = record_id
-                    && let Some(record) = self.pack.context_record(record_id)?
-                {
-                    admin_labels.push((
-                        layer,
+        let tuple = context.admin_context;
+        let admin_context = [
+            ("country", tuple.country_record_id),
+            ("region", tuple.region_record_id),
+            ("district", tuple.district_record_id),
+            ("locality", tuple.locality_record_id),
+            ("neighbourhood", tuple.neighbourhood_record_id),
+            ("place", tuple.place_record_id),
+        ];
+        for (_, record_id) in admin_context {
+            if let Some(record_id) = record_id
+                && let Entry::Vacant(entry) = context_labels.entry(record_id)
+            {
+                entry.insert(self.pack.context_record(record_id)?.map(|record| {
+                    (
                         normalized_for_match(Some(&record.label)),
                         normalized_for_match(Some(&record.name)),
-                    ));
-                }
+                    )
+                }));
             }
         }
 
-        if let Some(region) = desired_region
+        let mut admin_labels = Vec::new();
+        for (layer, record_id) in admin_context {
+            if let Some(record_id) = record_id
+                && let Some(Some((label, name))) = context_labels.get(&record_id)
+            {
+                admin_labels.push((layer, label.as_deref(), name.as_deref()));
+            }
+        }
+
+        if let Some(region) = desired.region.as_deref()
             && !admin_labels.iter().any(|(layer, label, name)| {
-                *layer == "region"
-                    && (label.as_deref() == Some(region.as_str())
-                        || name.as_deref() == Some(region.as_str()))
+                *layer == "region" && (*label == Some(region) || *name == Some(region))
             })
         {
             return Ok(false);
@@ -390,8 +448,7 @@ impl PackTextSearcher {
             let locality_layers = ["district", "locality", "neighbourhood", "place"];
             if !admin_labels.iter().any(|(layer, label, name)| {
                 locality_layers.contains(layer)
-                    && (label.as_deref() == Some(locality.as_str())
-                        || name.as_deref() == Some(locality.as_str()))
+                    && (*label == Some(locality) || *name == Some(locality))
             }) {
                 return Ok(false);
             }
@@ -438,16 +495,6 @@ impl PackTextSearcher {
         )?;
         // No postcode data nearby means nothing contradicts the row.
         Ok(in_area.unwrap_or(!strict))
-    }
-
-    fn search_fields(&self) -> Vec<tantivy::schema::Field> {
-        vec![
-            self.fields.label_text,
-            self.fields.name_text,
-            self.fields.content_text,
-            self.fields.address_number,
-            self.fields.postcode_exact,
-        ]
     }
 
     fn build_autocomplete_query(
@@ -560,6 +607,23 @@ impl PackTextSearcher {
         hits.truncate(limit);
         Ok(hits.into_iter().map(|(_, hit)| hit).collect())
     }
+}
+
+fn text_query_parser(index: &Index, fields: &TextIndexFields) -> QueryParser {
+    let search_fields = vec![
+        fields.label_text,
+        fields.name_text,
+        fields.content_text,
+        fields.address_number,
+        fields.postcode_exact,
+    ];
+    let mut query_parser = QueryParser::for_index(index, search_fields);
+    query_parser.set_conjunction_by_default();
+    query_parser.set_field_boost(fields.label_text, 3.0);
+    query_parser.set_field_boost(fields.name_text, 2.5);
+    query_parser.set_field_boost(fields.address_number, 2.0);
+    query_parser.set_field_boost(fields.postcode_exact, 2.0);
+    query_parser
 }
 
 /// Secondary order for hits with equal scores.
@@ -1054,6 +1118,65 @@ mod tests {
     }
 
     #[test]
+    fn geocode_rejects_a_different_region() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("geocode-region");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let region_id = writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Region,
+                    PlaceRecord {
+                        name: "Ontario".to_string(),
+                        place_type: "province".to_string(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 100),
+                    },
+                ),
+                None,
+            )
+            .expect("region");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "10", "King Street", None, None).into(),
+                Some(RecordContext {
+                    admin_context: AdminContextTuple {
+                        region_record_id: Some(region_id),
+                        ..AdminContextTuple::default()
+                    },
+                    flags: 0,
+                }),
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let geocode_region = |region: &str| {
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "10 King Street".to_string(),
+                    locality: None,
+                    region: Some(region.to_string()),
+                    postcode: None,
+                    limit: 10,
+                    layer: None,
+                    street_fallback: false,
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id)
+        };
+
+        assert_eq!(geocode_region("Quebec"), None);
+        assert_eq!(geocode_region("Ontario").as_deref(), Some("osm:node:1"));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn geocode_rejects_hits_in_a_different_postcode() {
         let temp_dir = temp_pack_path("geocode-postcode");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1080,6 +1203,40 @@ mod tests {
         assert_eq!(
             geocode(&searcher, "10 King Street", None, Some("M5V")).as_deref(),
             Some("osm:node:1")
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_matches_postcodes_by_prefix_in_either_direction() {
+        let temp_dir = temp_pack_path("geocode-postcode-prefixes");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, number, street, postcode) in [
+            ("osm:node:1", "10", "King Street", "K7L 1A1"),
+            ("osm:node:2", "12", "Queen Street", "K7L"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, None, Some(postcode)).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "10 King Street", None, Some("K7L")).as_deref(),
+            Some("osm:node:1")
+        );
+        assert_eq!(
+            geocode(&searcher, "10 King Street", None, Some("K7M")),
+            None
+        );
+        assert_eq!(
+            geocode(&searcher, "12 Queen Street", None, Some("K7L 1A1")).as_deref(),
+            Some("osm:node:2")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1568,6 +1725,36 @@ mod tests {
             })
             .expect_err("unparseable query");
         assert!(format!("{error:#}").contains("failed to parse search query"));
+        assert!(error.chain().any(|cause| cause.is::<InvalidQuery>()));
+        assert_eq!(
+            crate::http::problem::classify_search_error(error).status(),
+            400
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn search_reports_a_blank_query_as_invalid() {
+        let temp_dir = temp_pack_path("search-blank-query");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "10", "King Street", None, None).into(),
+                None,
+            )
+            .expect("write");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let error = searcher
+            .search(TextSearchOptions {
+                query: "   ".to_string(),
+                limit: 5,
+                layer: None,
+            })
+            .expect_err("blank query");
+        assert!(error.chain().any(|cause| cause.is::<InvalidQuery>()));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
