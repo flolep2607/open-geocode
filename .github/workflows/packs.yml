@@ -23,10 +23,12 @@ jobs:
       countries: ${{ steps.pick.outputs.countries }}
     steps:
       - id: pick
+        env:
+          COUNTRIES: ${{ inputs.countries }}
         run: |
           all='["australia-oceania/new-zealand","australia-oceania/australia","north-america/canada"]'
-          if [ -n "${{ inputs.countries }}" ]; then
-            all=$(echo '${{ inputs.countries }}' | jq -Rc 'split(",") | map(gsub("^ +| +$"; ""))')
+          if [ -n "$COUNTRIES" ]; then
+            all=$(printf '%s' "$COUNTRIES" | jq -Rc 'split(",") | map(gsub("^ +| +$"; ""))')
           fi
           echo "countries=$all" >> "$GITHUB_OUTPUT"
 
@@ -51,9 +53,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Download and verify the extract
+        env:
+          REGION: ${{ matrix.region }}
         run: |
-          name=$(basename "${{ matrix.region }}")
-          url="https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf"
+          name=$(basename "$REGION")
+          url="https://download.geofabrik.de/$REGION-latest.osm.pbf"
           mkdir -p work && cd work
           curl -fsSL --retry 5 -o "$name.osm.pbf" "$url"
           want=$(curl -fsSL "$url.md5" | awk '{print $1}')
@@ -72,16 +76,34 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # There is no checkout, so gh cannot infer the repository from a git remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view packs-latest >/dev/null 2>&1 || gh release create packs-latest --title "Packs (latest)" \
             --notes "Weekly open-geocode Packs built from Geofabrik extracts. Data (c) OpenStreetMap contributors, ODbL 1.0: https://www.openstreetmap.org/copyright. Large packs are split into .partNN files; join them with cat."
           cd work
+          api="repos/${{ github.repository }}/releases"
+          assets() { gh api "$api/tags/packs-latest" --jq '.assets[] | "\(.id) \(.name)"'; }
+          # Upload under temporary `.new` names first so the current pack stays downloadable until the
+          # swap. Leftovers from an earlier failed run would collide, so clear them out.
+          assets | while read -r id name; do
+            case "$name" in "$NAME.ogp.new" | "$NAME.ogp.new.part"*) gh api -X DELETE "$api/assets/$id" ;; esac
+          done
           size=$(stat -c %s "$NAME.ogp")
-          gh release delete-asset packs-latest "$NAME.ogp" -y 2>/dev/null || true
-          for old in $(gh release view packs-latest --json assets -q ".assets[].name" | grep "^$NAME.ogp.part"); do gh release delete-asset packs-latest "$old" -y; done
           if [ "$size" -gt 1900000000 ]; then
-            split -b 1900m -d -a 2 "$NAME.ogp" "$NAME.ogp.part"
-            gh release upload packs-latest "$NAME".ogp.part* --clobber
+            split -b 1900m -d -a 2 "$NAME.ogp" "$NAME.ogp.new.part"
+            gh release upload packs-latest "$NAME".ogp.new.part*
           else
-            gh release upload packs-latest "$NAME.ogp" --clobber
+            mv "$NAME.ogp" "$NAME.ogp.new"
+            gh release upload packs-latest "$NAME.ogp.new"
           fi
+          # Drop the old pack in either layout, so switching between a single file and parts leaves
+          # nothing stale, then strip `.new` from the uploads.
+          assets | while read -r id name; do
+            case "$name" in "$NAME.ogp" | "$NAME.ogp.part"*) gh api -X DELETE "$api/assets/$id" ;; esac
+          done
+          assets | while read -r id name; do
+            case "$name" in
+              "$NAME.ogp.new" | "$NAME.ogp.new.part"*) gh api -X PATCH "$api/assets/$id" -f name="${name/.ogp.new/.ogp}" ;;
+            esac
+          done

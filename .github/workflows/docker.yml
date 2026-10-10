@@ -1,8 +1,11 @@
 name: docker
 
-# Builds the server image and pushes it to ghcr.io/<owner>/open-geocode on every push to main.
+# Builds the server image and pushes it to ghcr.io/<owner>/open-geocode once CI has passed on a push
+# to main, so `latest` (which the packs workflow builds with) never points at a commit that failed CI.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -12,9 +15,17 @@ permissions:
 
 jobs:
   image:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    env:
+      # Under workflow_run, github.sha is the default branch tip, not the commit CI tested.
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: sha
+        run: echo "short=${HEAD_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -27,7 +38,9 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/open-geocode
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ steps.sha.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.HEAD_SHA }}
       - uses: docker/build-push-action@v6
         with:
           context: .
