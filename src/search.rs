@@ -766,20 +766,34 @@ fn expand_address_abbreviations(value: &str) -> String {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     let mut expanded = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
+        let french_street_prefix =
+            index + 1 < tokens.len() && (index == 0 || is_numeric_token(tokens[index - 1]));
+        let previous_token_is_french_prefix =
+            previous_token_is_french_street_type_or_article(&expanded);
         let replacement = match *token {
             "ave" | "av" => Some("avenue"),
-            "blvd" => Some("boulevard"),
+            "bd" | "blvd" | "bld" | "boul" => Some("boulevard"),
             "cir" => Some("circle"),
             "ct" | "crt" => Some("court"),
             "cres" => Some("crescent"),
             "dr" => Some("drive"),
+            "r" if french_street_prefix => Some("rue"),
+            "ch" if french_street_prefix => Some("chemin"),
+            "che" if french_street_prefix => Some("chemin"),
+            "all" if french_street_prefix => Some("allee"),
+            "rte" => Some("route"),
+            "imp" => Some("impasse"),
+            "fbg" => Some("faubourg"),
+            "st" if previous_token_is_french_prefix => Some("saint"),
+            "ste" if previous_token_is_french_prefix => Some("sainte"),
+            "st" if index > 0 && !is_numeric_token(tokens[index - 1]) => Some("street"),
+            "str" => Some("strasse"),
             "hwy" => Some("highway"),
             "ln" => Some("lane"),
             "pkwy" => Some("parkway"),
             "pl" => Some("place"),
             "rd" => Some("road"),
             "sq" => Some("square"),
-            "st" if index > 0 && !is_numeric_token(tokens[index - 1]) => Some("street"),
             "ter" | "terr" => Some("terrace"),
             "trl" | "tr" => Some("trail"),
             "wy" => Some("way"),
@@ -789,15 +803,24 @@ fn expand_address_abbreviations(value: &str) -> String {
             "w" if previous_token_is_street_type(&expanded) => Some("west"),
             _ => None,
         };
-        expanded.push(replacement.unwrap_or(*token));
+        let expanded_token = if let Some(replacement) = replacement {
+            replacement.to_string()
+        } else if token.chars().count() > 3 {
+            token
+                .strip_suffix("str")
+                .map_or_else(|| token.to_string(), |prefix| format!("{prefix}strasse"))
+        } else {
+            token.to_string()
+        };
+        expanded.push(expanded_token);
     }
     expanded.join(" ")
 }
 
-fn previous_token_is_street_type(tokens: &[&str]) -> bool {
+fn previous_token_is_street_type(tokens: &[String]) -> bool {
     tokens.last().is_some_and(|token| {
         matches!(
-            *token,
+            token.as_str(),
             "avenue"
                 | "boulevard"
                 | "circle"
@@ -814,6 +837,29 @@ fn previous_token_is_street_type(tokens: &[&str]) -> bool {
                 | "terrace"
                 | "trail"
                 | "way"
+        )
+    })
+}
+
+fn previous_token_is_french_street_type_or_article(tokens: &[String]) -> bool {
+    tokens.last().is_some_and(|token| {
+        matches!(
+            token.as_str(),
+            "rue"
+                | "avenue"
+                | "boulevard"
+                | "route"
+                | "chemin"
+                | "place"
+                | "impasse"
+                | "allee"
+                | "quai"
+                | "faubourg"
+                | "de"
+                | "du"
+                | "des"
+                | "la"
+                | "le"
         )
     })
 }
@@ -978,6 +1024,44 @@ mod tests {
         let variants = search_query_variants("St Clair Ave W");
         assert!(variants.contains(&"st clair avenue west".to_string()));
         assert!(!variants.contains(&"street clair avenue west".to_string()));
+    }
+
+    #[test]
+    fn search_query_variants_expand_french_and_german_abbreviations() {
+        for (query, expected) in [
+            ("12 r de la gare luxembourg", "12 rue de la gare luxembourg"),
+            ("bahnhofstr 3 zurich", "bahnhofstrasse 3 zurich"),
+            ("rte de fribourg 4", "route de fribourg 4"),
+            ("ch des pecheurs 4 perroy", "chemin des pecheurs 4 perroy"),
+            ("che des pecheurs 4 perroy", "chemin des pecheurs 4 perroy"),
+            ("all des fleurs", "allee des fleurs"),
+            ("av st jean 5", "avenue saint jean 5"),
+            ("rue ste croix", "rue sainte croix"),
+            ("12 main st", "12 main street"),
+        ] {
+            assert!(
+                search_query_variants(query).contains(&expected.to_string()),
+                "missing {expected:?} for {query:?}"
+            );
+        }
+
+        assert_eq!(
+            expand_address_abbreviations("bd bld boul rte imp fbg str pass"),
+            "boulevard boulevard boulevard route impasse faubourg strasse pass"
+        );
+        assert_eq!(expand_address_abbreviations("perroy ch 4"), "perroy ch 4");
+
+        let variants = search_query_variants("rue du lac 1 1000 lausanne ch");
+        assert!(
+            variants
+                .iter()
+                .any(|variant| variant.ends_with("lausanne ch"))
+        );
+        assert!(
+            variants
+                .iter()
+                .all(|variant| !variant.ends_with("lausanne chemin"))
+        );
     }
 
     #[test]
@@ -1807,6 +1891,45 @@ mod tests {
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.id, "osm:node:1");
         assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn search_matches_french_chemin_abbreviation() {
+        let temp_dir = temp_pack_path("search-french-chemin-abbreviation");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "4",
+                    "Chemin des Pêcheurs",
+                    Some("Perroy"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("write address");
+        writer.finish().expect("finish");
+
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "Ch. des Pêcheurs 4, Perroy".to_string(),
+                limit: 5,
+                layer: None,
+            })
+            .expect("search");
+
+        assert!(
+            hits.iter().any(|hit| hit.record.id == "osm:node:1"),
+            "expected the abbreviated query to find the address"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
