@@ -83,10 +83,13 @@ cargo run --release -- build --input new-zealand.osm.pbf --addresses linz=oa_nz.
 ```
 
 - Rows are streamed in batches and go through the same sorters, boundary context, postcode centroids, text index and reverse geocoding as OSM addresses, so the memory budget holds whatever the file size.
+- Imported rows matching an OSM address with the same street and number within 150 m are skipped; imported rows are not deduplicated against each other.
+- The build report records input rows in `scanned.address_rows` and OSM matches skipped in `scanned.duplicate_address_rows`.
 - A record's id is `dataset:row` (`linz:42`): the dataset name, or the file stem without one, and the row's 1-based position among the data rows. Its source reports object type `row`.
 - Rows without a number or street, or with coordinates that are missing, not numeric or out of range, are skipped and counted in the build report (`scanned.address_rows`, `rejected.by_reason`). A record with a line break inside a field, as a stray quote makes it, is rejected as `malformed_row`, and the rows it swallows are lost with it; files should be well-formed CSV.
-- Rows are not deduplicated against OSM addresses or each other.
 - Packs without imported rows are unchanged and older Packs still open. A Pack with imported rows stores its record sections as version 5, so an older binary refuses it when it opens it.
+
+Official address sources have their own attribution terms: Luxembourg BD-Adresses is CC0. For swisstopo data, use the attribution `Source: Federal Office of Topography swisstopo` and see <https://www.swisstopo.admin.ch/ogd-conditions>.
 
 ## Rebuilding packs safely
 

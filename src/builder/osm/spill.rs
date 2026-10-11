@@ -235,7 +235,7 @@ fn tags_bytes(tags: &BTreeMap<String, String>) -> usize {
         .sum()
 }
 
-fn record_heap_bytes(record: &Record) -> usize {
+pub(super) fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
         Record::Address(record) => {
             let address = &record.address;
@@ -266,7 +266,7 @@ fn record_heap_bytes(record: &Record) -> usize {
     strings + positions + 128
 }
 
-fn encode_record(out: &mut Vec<u8>, record: &Record) {
+pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
     out.push(
         Layer::ALL
             .iter()
@@ -337,7 +337,7 @@ fn encode_record(out: &mut Vec<u8>, record: &Record) {
     }
 }
 
-fn decode_record(input: &mut &[u8]) -> Result<Record> {
+pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
     let layer = *Layer::ALL
         .get(usize::from(get_u8(input)?))
         .context("unknown spilled record layer")?;
