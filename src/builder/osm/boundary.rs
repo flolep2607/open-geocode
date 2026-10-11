@@ -3,9 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
 };
 
-use geo::{
-    Area, BoundingRect, Centroid, Contains, Covers, LineString, MultiPolygon, Point, Polygon, Rect,
-};
+use geo::{Area, BoundingRect, Centroid, Contains, LineString, MultiPolygon, Polygon, Rect};
 use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
@@ -16,6 +14,7 @@ use crate::{
     util::text::normalize_for_compare,
 };
 
+use super::boundary_pip::PreparedBoundaryPip;
 use super::tags::OsmTags;
 
 /// Tags a boundary keeps after the scan.
@@ -66,6 +65,7 @@ pub(crate) struct BoundaryWay {
 #[derive(Debug)]
 pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
+    prepared: Vec<Option<PreparedBoundaryPip>>,
     tree: RTree<BoundaryBox>,
 }
 
@@ -245,19 +245,29 @@ impl RTreeObject for BoundaryBox {
 
 impl BoundaryIndex {
     fn new(boundaries: Vec<AcceptedBoundary>) -> Self {
-        let boxes = boundaries
+        let prepared = boundaries
+            .iter()
+            .map(|boundary| {
+                boundary
+                    .geometry
+                    .bounding_rect()
+                    .map(|bbox| PreparedBoundaryPip::new(&boundary.geometry, bbox))
+            })
+            .collect::<Vec<_>>();
+        let boxes = prepared
             .iter()
             .enumerate()
-            .filter_map(|(boundary_id, boundary)| {
-                let bbox = boundary.geometry.bounding_rect()?;
+            .filter_map(|(boundary_id, prepared)| {
+                let prepared = prepared.as_ref()?;
                 Some(BoundaryBox {
-                    envelope: envelope_from_rect(bbox),
+                    envelope: envelope_from_rect(prepared.bounding_rect()),
                     boundary_id,
                 })
             })
             .collect::<Vec<_>>();
         Self {
             boundaries,
+            prepared,
             tree: RTree::bulk_load(boxes),
         }
     }
@@ -272,12 +282,14 @@ impl BoundaryIndex {
             return RecordContext::default();
         }
 
-        let point = Point::new(lon, lat);
         let envelope = AABB::from_point([lon, lat]);
         let mut covered = Vec::new();
         for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
             let boundary = &self.boundaries[boundary_box.boundary_id];
-            if boundary.geometry.covers(&point) {
+            if self.prepared[boundary_box.boundary_id]
+                .as_ref()
+                .is_some_and(|prepared| prepared.covers(lon, lat))
+            {
                 covered.push(boundary);
             }
         }
