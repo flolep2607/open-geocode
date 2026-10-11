@@ -15,7 +15,9 @@
 //! ```
 
 mod address;
+mod address_dedupe;
 mod boundary;
+mod boundary_pip;
 mod emit;
 mod emitted;
 mod geometry;
@@ -59,6 +61,7 @@ use crate::{
     records::quantize,
     util::hilbert::hilbert_key,
 };
+use address_dedupe::{AddressDedupeKey, ImportedAddress, filter_imported};
 use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_context};
 use emit::{FeatureOutput, emit_features};
 use emitted::Emitted;
@@ -106,9 +109,8 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         bail!("input {} does not exist", options.input.display());
     }
     validate(&options.addresses)?;
-    // Up to four sorters hold memory at the same time (node references or
-    // resolved coordinates, the two record sorters, the spatial pairs); the text
-    // index buffers take the same share as one sorter while records are written.
+    // The OSM/import address sorters use smaller shares because they may overlap
+    // the record sorters; the shared memory pool spills them as needed.
     let sorter_budget = (options.memory_budget_bytes / 4).max(1);
     let memory = MemoryBudget::new(options.memory_budget_bytes);
     let mut writer = PackWriter::create_with(
@@ -139,6 +141,16 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
             sorter_budget / 4,
         ),
         seq: 0,
+    };
+    let mut osm_address_keys = if options.addresses.is_empty() {
+        None
+    } else {
+        Some(ExternalSorter::new(
+            &scratch,
+            "osm-address-keys",
+            &memory,
+            sorter_budget / 4,
+        ))
     };
     build.report.scratch.memory_budget_bytes = options.memory_budget_bytes as u64;
 
@@ -184,7 +196,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
                 features.write(&feature)?;
             }
             relations.extend(output.relations);
-            build.absorb(output.emitted)
+            build.absorb(output.emitted, &mut osm_address_keys)
         },
     )?;
     build.report.phases.scan_ms = phase.elapsed().as_millis();
@@ -245,7 +257,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
         |output: FeatureOutput| {
             progress.inc(1);
             boundary_ways.extend(output.boundary_ways);
-            build.absorb(output.emitted)
+            build.absorb(output.emitted, &mut osm_address_keys)
         },
     )?;
     progress.finish_with_message("4/7 assemble ways complete");
@@ -254,10 +266,31 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     // Imported address rows join the OSM addresses before boundaries and
     // postcode centroids are derived from them.
     let phase = Instant::now();
-    for file in &options.addresses {
-        let progress = stage_progress("import address rows");
-        import_addresses(file, |emitted| build.absorb(emitted))?;
-        progress.finish_with_message("import address rows complete");
+    let mut osm_address_stats = SortStats::default();
+    let mut imported_address_stats = SortStats::default();
+    if !options.addresses.is_empty() {
+        let mut imported_addresses =
+            ExternalSorter::new(&scratch, "imported-addresses", &memory, sorter_budget / 4);
+        for file in &options.addresses {
+            let progress = stage_progress("import address rows");
+            import_addresses(file, |emitted| {
+                build.absorb_import_batch(emitted, &mut imported_addresses)
+            })?;
+            progress.finish_with_message("import address rows complete");
+        }
+        let osm_address_keys = osm_address_keys
+            .take()
+            .expect("OSM address keys are collected when imports are configured");
+        osm_address_stats = osm_address_keys.stats();
+        imported_address_stats = imported_addresses.stats();
+        let progress = stage_progress("deduplicate imported addresses");
+        let duplicate_address_rows = filter_imported(
+            osm_address_keys.finish()?,
+            imported_addresses.finish()?,
+            |record| build.absorb_imported_address(record),
+        )?;
+        build.report.scanned.duplicate_address_rows = duplicate_address_rows;
+        progress.finish_with_message("address deduplication complete");
     }
     build.report.phases.address_import_ms = phase.elapsed().as_millis();
 
@@ -363,6 +396,8 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     for (name, stats) in [
         ("node_requests", request_stats),
         ("resolved_nodes", resolved_stats),
+        ("osm_address_keys", osm_address_stats),
+        ("imported_addresses", imported_address_stats),
         ("records", record_stats),
         ("context_records", context_stats),
         (
@@ -407,7 +442,11 @@ struct Build {
 
 impl Build {
     /// Merge one worker's output, in input order.
-    fn absorb(&mut self, emitted: Emitted) -> Result<()> {
+    fn absorb(
+        &mut self,
+        emitted: Emitted,
+        osm_address_keys: &mut Option<ExternalSorter<AddressDedupeKey>>,
+    ) -> Result<()> {
         let Emitted {
             report,
             records,
@@ -420,9 +459,39 @@ impl Build {
             self.audit.write(rejection)?;
         }
         for record in records {
+            if let (Some(keys), Record::Address(_)) = (osm_address_keys.as_mut(), &record) {
+                keys.push(AddressDedupeKey::from_record(&record)?)?;
+            }
             self.push(record, None)?;
         }
         Ok(())
+    }
+
+    fn absorb_import_batch(
+        &mut self,
+        mut emitted: Emitted,
+        imported_addresses: &mut ExternalSorter<ImportedAddress>,
+    ) -> Result<()> {
+        emitted.report.accepted = Default::default();
+        emitted.report.quality = Default::default();
+        emitted.report.completeness = Default::default();
+        self.report.merge(emitted.report);
+        for rejection in &emitted.rejections {
+            self.audit.write(rejection)?;
+        }
+        for record in emitted.records {
+            imported_addresses.push(ImportedAddress::from_record(record)?)?;
+        }
+        Ok(())
+    }
+
+    fn absorb_imported_address(&mut self, record: Record) -> Result<()> {
+        let Record::Address(address) = &record else {
+            anyhow::bail!("imported address sorter contained a non-address record");
+        };
+        self.report.accept_address_with_tags(address, None);
+        self.postcodes.accept_address(address);
+        self.push(record, None)
     }
 
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
@@ -963,6 +1032,71 @@ mod tests {
             .expect("result");
         assert_eq!(result.match_kind, ReverseMatchKind::ExplicitAddress);
         assert_eq!(result.id.as_deref(), Some("oa:1"));
+    }
+
+    #[test]
+    fn drops_imported_rows_matching_osm_addresses_only() {
+        let dir = temp_dir("address-dedupe");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("rows.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET\n\
+             -79.39975,43.6,10,King Street\n\
+             -79.3935,43.6,10,King Street\n\
+             -79.4,43.6,11,King Street\n\
+             -79.39975,43.6,10,KING-STREET\n\
+             1,1,9,Remote Street\n\
+             1,1.001,9,Remote Street\n\
+             1,1, ,King Street\n",
+        )
+        .expect("csv");
+        let report = build_osm_pack(BuildOsmOptions {
+            input,
+            pack: dir.join("pack"),
+            addresses: vec![AddressFile {
+                dataset: "oa".to_string(),
+                path: csv,
+            }],
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        assert_eq!(report.scanned.address_rows, 7);
+        assert_eq!(report.scanned.duplicate_address_rows, 2);
+        assert_eq!(report.accepted.imported_addresses, 4);
+        assert_eq!(report.rejected.by_reason["missing_housenumber"], 1);
+
+        let reader = PackReader::open(dir.join("pack")).expect("reader");
+        assert_eq!(reader.manifest().layer_counts["address"], 9);
+        for source_id in ["oa:2", "oa:3", "oa:5", "oa:6"] {
+            assert!(
+                reader
+                    .find_by_source_id(source_id)
+                    .expect("lookup")
+                    .is_some(),
+                "{source_id} should survive"
+            );
+        }
+        for source_id in ["oa:1", "oa:4", "oa:7"] {
+            assert!(
+                reader
+                    .find_by_source_id(source_id)
+                    .expect("lookup")
+                    .is_none(),
+                "{source_id} should not appear in the Pack"
+            );
+        }
+        let rejections = reader.rejections(0).expect("rejections");
+        for duplicate_row in [1, 4] {
+            assert!(
+                !rejections
+                    .iter()
+                    .any(|rejection| rejection.source == SourceProvenance::row("oa", duplicate_row)),
+                "duplicate row oa:{duplicate_row} must not enter the rejection audit"
+            );
+        }
     }
 
     #[test]

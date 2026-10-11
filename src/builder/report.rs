@@ -7,7 +7,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 14;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
@@ -64,6 +64,7 @@ impl BuilderReport {
         self.scanned.ways += scanned.ways;
         self.scanned.relations += scanned.relations;
         self.scanned.address_rows += scanned.address_rows;
+        self.scanned.duplicate_address_rows += scanned.duplicate_address_rows;
 
         self.accepted.total += accepted.total;
         merge_counts(&mut self.accepted.by_layer, accepted.by_layer);
@@ -204,6 +205,9 @@ pub struct ScannedCounts {
     pub relations: u64,
     /// Rows read from imported address files.
     pub address_rows: u64,
+    /// Imported address rows skipped because an OSM address matched.
+    #[serde(default)]
+    pub duplicate_address_rows: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
