@@ -1396,6 +1396,7 @@ dependencies = [
  "memmap2 0.9.10",
  "osmpbf",
  "rayon",
+ "robust",
  "rstar 0.12.2",
  "serde",
  "serde_json",

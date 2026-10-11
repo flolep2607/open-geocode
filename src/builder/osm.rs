@@ -16,6 +16,7 @@
 
 mod address;
 mod boundary;
+mod boundary_pip;
 mod emit;
 mod emitted;
 mod geometry;
