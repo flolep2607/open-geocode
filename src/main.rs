@@ -51,7 +51,8 @@ enum Commands {
         /// OpenAddresses-format CSV of extra addresses (LON, LAT, NUMBER,
         /// STREET required; UNIT, CITY, REGION, POSTCODE optional), as
         /// `dataset=path` or `path` (the file stem names the dataset). Records
-        /// get the id `dataset:row`. Repeat for several files.
+        /// get the id `dataset:row`. Rows matching an OSM address with the
+        /// same street and number within 150 m are skipped. Repeat for files.
         #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
         addresses: Vec<AddressFile>,
     },
