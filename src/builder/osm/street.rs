@@ -5,11 +5,14 @@ use crate::{
     record::{OsmObjectType, Record, SourceProvenance, StreetRecord},
 };
 
-use super::{emitted::Emitted, geometry::line_string_geometry, tags::OsmTags};
+use super::{emitted::Emitted, geometry::simplified_line_string_geometry, tags::OsmTags};
 
 /// Tags a street feature keeps after the scan: the name it is indexed under and
 /// what the audit needs to explain a rejection.
 const STREET_TAG_KEYS: [&str; 3] = ["highway", "name", "ref"];
+
+// About one metre north-south and less east-west at every latitude.
+const STREET_LINE_SIMPLIFY_EPSILON: f64 = 9e-6;
 
 pub(crate) fn has_highway_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("highway")
@@ -42,7 +45,7 @@ pub(crate) fn emit_street(
     out: &mut Emitted,
 ) {
     let record = street_name(tags).zip(points).and_then(|(name, points)| {
-        let built = line_string_geometry(points)?;
+        let built = simplified_line_string_geometry(points, STREET_LINE_SIMPLIFY_EPSILON)?;
         Some(StreetRecord {
             name,
             geometry: built.geometry,
@@ -80,6 +83,26 @@ mod tests {
         ])
     }
 
+    fn street_record(points: &[(f64, f64)]) -> StreetRecord {
+        let mut out = Emitted::default();
+        emit_street(99, &street_tags(&tags()), Some(points), &mut out);
+
+        let Some(Record::Street(record)) = out.records.pop() else {
+            panic!("expected a street record");
+        };
+        record
+    }
+
+    fn street_coordinates(record: &StreetRecord) -> Vec<[f64; 2]> {
+        match &record.geometry.value {
+            GeometryValue::LineString { coordinates } => coordinates
+                .iter()
+                .map(|position| [position[0], position[1]])
+                .collect(),
+            other => panic!("expected LineString, got {}", other.type_name()),
+        }
+    }
+
     #[test]
     fn builds_street_record_from_named_highway_way() {
         let mut out = Emitted::default();
@@ -105,6 +128,43 @@ mod tests {
             other => panic!("expected LineString, got {}", other.type_name()),
         }
         assert_eq!(out.report.accepted.street_segments, 1);
+    }
+
+    #[test]
+    fn simplifies_collinear_street_vertices() {
+        let record = street_record(&[(0.0, 0.0), (0.0, 0.001), (0.0, 0.002), (0.0, 0.003)]);
+
+        assert_eq!(street_coordinates(&record), vec![[0.0, 0.0], [0.003, 0.0]]);
+    }
+
+    #[test]
+    fn keeps_street_bends_larger_than_the_tolerance() {
+        let record = street_record(&[(0.0, 0.0), (0.001, 0.005), (0.0, 0.01)]);
+
+        assert_eq!(
+            street_coordinates(&record),
+            vec![[0.0, 0.0], [0.005, 0.001], [0.01, 0.0]]
+        );
+    }
+
+    #[test]
+    fn keeps_the_unsimplified_street_representative_point() {
+        let points = [(0.0, 0.0), (0.000002, 0.005), (0.0, 0.01)];
+        let expected = super::super::geometry::line_string_geometry(&points)
+            .expect("unsimplified line geometry")
+            .representative_point;
+
+        assert_eq!(street_record(&points).representative_point, expected);
+    }
+
+    #[test]
+    fn leaves_two_point_streets_unchanged() {
+        let record = street_record(&[(43.64, -79.41), (43.66, -79.36)]);
+
+        assert_eq!(
+            street_coordinates(&record),
+            vec![[-79.41, 43.64], [-79.36, 43.66]]
+        );
     }
 
     #[test]
