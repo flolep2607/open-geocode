@@ -23,6 +23,7 @@
 use std::{cmp::Ordering, collections::HashMap, io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use geo::{Distance, Haversine, Point};
 use geojson::GeometryValue;
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
@@ -737,14 +738,7 @@ fn local_xy_m(lon: f64, lat: f64, origin_lon: f64, origin_lat: f64) -> (f64, f64
 }
 
 pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
-    let d_lat = (b_lat - a_lat).to_radians();
-    let d_lon = (b_lon - a_lon).to_radians();
-    let a_lat = a_lat.to_radians();
-    let b_lat = b_lat.to_radians();
-    let sin_d_lat = (d_lat / 2.0).sin();
-    let sin_d_lon = (d_lon / 2.0).sin();
-    let h = sin_d_lat * sin_d_lat + a_lat.cos() * b_lat.cos() * sin_d_lon * sin_d_lon;
-    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
+    Haversine.distance(Point::new(a_lon, a_lat), Point::new(b_lon, b_lat))
 }
 
 trait CandidateDistance {
@@ -807,6 +801,34 @@ mod tests {
         },
         records::RecordsWriter,
     };
+
+    #[test]
+    fn haversine_matches_previous_formula() {
+        let pairs: [((f64, f64), (f64, f64)); 5] = [
+            ((-0.1, 51.5), (-0.099, 51.501)),
+            ((0.0, 0.0), (0.9, 0.0)),
+            ((179.9, 0.0), (-179.9, 0.0)),
+            ((45.0, 89.9), (-135.0, 89.9)),
+            ((12.5, -24.0), (12.5, -24.0)),
+        ];
+
+        for ((a_lon, a_lat), (b_lon, b_lat)) in pairs {
+            let d_lat = (b_lat - a_lat).to_radians();
+            let d_lon = (b_lon - a_lon).to_radians();
+            let a_lat_rad = a_lat.to_radians();
+            let b_lat_rad = b_lat.to_radians();
+            let sin_d_lat = (d_lat / 2.0).sin();
+            let sin_d_lon = (d_lon / 2.0).sin();
+            let h =
+                sin_d_lat * sin_d_lat + a_lat_rad.cos() * b_lat_rad.cos() * sin_d_lon * sin_d_lon;
+            let previous = 2.0 * EARTH_RADIUS_M * h.sqrt().asin();
+
+            assert!(
+                (haversine_m(a_lon, a_lat, b_lon, b_lat) - previous).abs() <= 1e-6,
+                "pair ({a_lon}, {a_lat}) to ({b_lon}, {b_lat})",
+            );
+        }
+    }
 
     #[test]
     fn closest_candidates_matches_stable_full_sort() {

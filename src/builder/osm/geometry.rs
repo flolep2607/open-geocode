@@ -1,4 +1,4 @@
-use geo::{Area, BoundingRect, Centroid, LineString, Point, Polygon, Rect};
+use geo::{Area, BoundingRect, Centroid, LineString, Point, Polygon, Rect, Simplify};
 use geojson::{Bbox, Geometry, GeometryValue};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +25,21 @@ pub(crate) fn line_string_geometry(points: &[(f64, f64)]) -> Option<NonPointGeom
     Some(NonPointGeometry {
         geometry,
         representative_point: line_string.centroid().map(position_from_point)?,
+    })
+}
+
+pub(crate) fn simplified_line_string_geometry(
+    points: &[(f64, f64)],
+    epsilon: f64,
+) -> Option<NonPointGeometry> {
+    let line_string = line_string(points)?;
+    let representative_point = line_string.centroid().map(position_from_point)?;
+    let simplified = line_string.simplify(epsilon);
+    let mut geometry = Geometry::new(GeometryValue::from(&simplified));
+    geometry.bbox = simplified.bounding_rect().map(bbox_from_rect);
+    Some(NonPointGeometry {
+        geometry,
+        representative_point,
     })
 }
 
