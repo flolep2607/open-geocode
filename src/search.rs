@@ -43,7 +43,6 @@ pub struct InvalidQuery {
 enum MatchMode {
     Strict,
     Fuzzy,
-    Relaxed,
 }
 
 impl fmt::Display for InvalidQuery {
@@ -190,7 +189,7 @@ impl PackTextSearcher {
             .into());
         }
 
-        for mode in [MatchMode::Strict, MatchMode::Fuzzy, MatchMode::Relaxed] {
+        for mode in [MatchMode::Strict, MatchMode::Fuzzy] {
             let (_, hits) =
                 self.search_variants(query_text, options.layer.as_deref(), limit, mode, |_| {
                     Ok(true)
@@ -232,7 +231,7 @@ impl PackTextSearcher {
         };
 
         let candidates = address_geocode_candidates(address, options.postcode.as_deref());
-        for mode in [MatchMode::Strict, MatchMode::Fuzzy, MatchMode::Relaxed] {
+        for mode in [MatchMode::Strict, MatchMode::Fuzzy] {
             for candidate in &candidates {
                 let (query, hits) = self.search_variants(
                     candidate,
@@ -366,10 +365,8 @@ impl PackTextSearcher {
         &self,
         query_text: &str,
         layer: Option<&str>,
-        relaxed: bool,
-    ) -> Result<Option<Box<dyn Query>>> {
-        let mut number_clauses = Vec::new();
-        let mut other_clauses = Vec::new();
+    ) -> Result<Box<dyn Query>> {
+        let mut subqueries = Vec::new();
 
         for token in query_text.split_whitespace() {
             let exact_query =
@@ -394,37 +391,7 @@ impl PackTextSearcher {
                     (Occur::Should, Box::new(fuzzy_query)),
                 ])) as Box<dyn Query>
             };
-            if starts_with_digit {
-                number_clauses.push((Occur::Must, clause));
-            } else {
-                other_clauses.push(clause);
-            }
-        }
-
-        if relaxed && other_clauses.len() < 3 {
-            return Ok(None);
-        }
-
-        let mut subqueries = number_clauses;
-        if relaxed {
-            let minimum_required = other_clauses.len() - 1;
-            let clauses = other_clauses
-                .into_iter()
-                .map(|clause| (Occur::Should, clause))
-                .collect();
-            subqueries.push((
-                Occur::Must,
-                Box::new(BooleanQuery::with_minimum_required_clauses(
-                    clauses,
-                    minimum_required,
-                )),
-            ));
-        } else {
-            subqueries.extend(
-                other_clauses
-                    .into_iter()
-                    .map(|clause| (Occur::Must, clause)),
-            );
+            subqueries.push((Occur::Must, clause));
         }
 
         if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
@@ -436,7 +403,7 @@ impl PackTextSearcher {
                 )),
             ));
         }
-        Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+        Ok(Box::new(BooleanQuery::new(subqueries)))
     }
 
     /// Try the query as written, then normalized and expanded rewrites, and
@@ -456,18 +423,16 @@ impl PackTextSearcher {
         let mut parsed_any = false;
         let variants = match mode {
             MatchMode::Strict => search_query_variants(query_text),
-            MatchMode::Fuzzy | MatchMode::Relaxed => tolerant_search_query_variants(query_text),
+            MatchMode::Fuzzy => tolerant_search_query_variants(query_text),
         };
         for variant in variants {
             last_query = variant.clone();
             let query = match mode {
-                MatchMode::Strict => self.build_query(&variant, layer).map(Some),
-                MatchMode::Fuzzy => self.build_tolerant_query(&variant, layer, false),
-                MatchMode::Relaxed => self.build_tolerant_query(&variant, layer, true),
+                MatchMode::Strict => self.build_query(&variant, layer),
+                MatchMode::Fuzzy => self.build_tolerant_query(&variant, layer),
             };
             let query = match query {
-                Ok(Some(query)) => query,
-                Ok(None) => continue,
+                Ok(query) => query,
                 Err(error) => {
                     parse_error = Some(error);
                     continue;
@@ -515,10 +480,9 @@ impl PackTextSearcher {
         // suburbs are not admin_level 8 everywhere, and some countries map none.
         let desired_locality = match desired.locality.as_deref() {
             Some(locality) => {
-                let own = self
-                    .pack
-                    .address(hit.record_id)?
-                    .and_then(|record| normalized_for_match(record.address.locality.as_deref()));
+                let own = self.pack.address(hit.record_id)?.and_then(|record| {
+                    normalized_context_for_match(record.address.locality.as_deref())
+                });
                 (own.as_deref() != Some(locality)).then_some(locality)
             }
             None => None,
@@ -543,8 +507,8 @@ impl PackTextSearcher {
             {
                 entry.insert(self.pack.context_record(record_id)?.map(|record| {
                     (
-                        normalized_for_match(Some(&record.label)),
-                        normalized_for_match(Some(&record.name)),
+                        normalized_context_for_match(Some(&record.label)),
+                        normalized_context_for_match(Some(&record.name)),
                     )
                 }));
             }
@@ -1151,14 +1115,24 @@ fn normalized_for_match(value: Option<&str>) -> Option<String> {
     normalize_index_text(value?.trim())
 }
 
+fn normalized_context_for_match(value: Option<&str>) -> Option<String> {
+    let normalized = normalized_for_match(value)?;
+    Some(
+        normalized
+            .replace("ae", "a")
+            .replace("oe", "o")
+            .replace("ue", "u"),
+    )
+}
+
 /// The region, locality and postcode a hit must match. Blank values count as
 /// absent, so a hit is only checked against context that can reject it.
 fn desired_address_context(
     options: &AddressGeocodeOptions,
 ) -> (Option<String>, Option<String>, Option<String>) {
     (
-        normalized_for_match(options.region.as_deref()),
-        normalized_for_match(options.locality.as_deref()),
+        normalized_context_for_match(options.region.as_deref()),
+        normalized_context_for_match(options.locality.as_deref()),
         normalized_postcode_for_match(options.postcode.as_deref()),
     )
 }
@@ -1341,9 +1315,8 @@ mod tests {
         );
 
         let tolerant_query = searcher
-            .build_tolerant_query("rue hautte", None, false)
-            .expect("tolerant query")
-            .expect("query");
+            .build_tolerant_query("rue hautte", None)
+            .expect("tolerant query");
         let hits = searcher
             .ranked_hits(&tolerant_query, "rue hautte", 10)
             .expect("tolerant hits");
@@ -1352,8 +1325,92 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_search_allows_one_unmatched_word_only_for_three_or_more() {
-        let temp_dir = temp_pack_path("relaxed-search");
+    fn search_and_geocode_require_the_distinctive_street_word() {
+        let temp_dir = temp_pack_path("no-relaxed-street-drop");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "11",
+                    "Kapellstrasse",
+                    Some("Egg"),
+                    Some("8847"),
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert!(
+            searcher
+                .search(TextSearchOptions {
+                    query: "Roblosenweg 11, 8847 Egg".to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("search")
+                .is_empty()
+        );
+        assert!(
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "Roblosenweg 11".to_string(),
+                    locality: Some("Egg".to_string()),
+                    region: None,
+                    postcode: None,
+                    limit: 10,
+                    layer: None,
+                    street_fallback: true,
+                })
+                .expect("geocode")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn search_does_not_drop_a_wrong_town_token() {
+        let temp_dir = temp_pack_path("no-relaxed-town-drop");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "16",
+                    "Rue du Cimetière",
+                    Some("Sandweiler"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert!(
+            searcher
+                .search(TextSearchOptions {
+                    query: "16 Rue du Cimetière Arsdorf".to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("search")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fuzzy_search_matches_a_typoed_town_without_dropping_it() {
+        let temp_dir = temp_pack_path("fuzzy-town-typo");
         let _ = std::fs::remove_dir_all(&temp_dir);
         let mut writer = PackWriter::create(&temp_dir).expect("writer");
         writer
@@ -1373,25 +1430,24 @@ mod tests {
         writer.finish().expect("finish");
         let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
 
+        let strict_query = searcher
+            .build_query("rue haute luxemburg", None)
+            .expect("strict query");
+        assert!(
+            searcher
+                .ranked_hits(&strict_query, "rue haute luxemburg", 10)
+                .expect("strict hits")
+                .is_empty()
+        );
         let hits = searcher
             .search(TextSearchOptions {
-                query: "rue haute luxemburgx foo".to_string(),
+                query: "rue haute luxemburg".to_string(),
                 limit: 10,
                 layer: None,
             })
-            .expect("relaxed search");
+            .expect("fuzzy search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "osm:node:1");
-        assert!(
-            searcher
-                .search(TextSearchOptions {
-                    query: "rue foo".to_string(),
-                    limit: 10,
-                    layer: None,
-                })
-                .expect("two-word search")
-                .is_empty()
-        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -1429,6 +1485,48 @@ mod tests {
             geocode(&searcher, "10 Kinng Street", None, Some("K7L 1A1")),
             None
         );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_context_matches_umlaut_transliterations() {
+        let temp_dir = temp_pack_path("geocode-umlaut-context");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "10",
+                    "Bahnhofstrasse",
+                    Some("Zürich"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let geocode = |locality: &str| {
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "10 Bahnhofstrasse".to_string(),
+                    locality: Some(locality.to_string()),
+                    region: None,
+                    postcode: None,
+                    limit: 10,
+                    layer: None,
+                    street_fallback: false,
+                })
+                .expect("geocode")
+                .map(|hit| hit.hit.record.id)
+        };
+
+        assert_eq!(geocode("Zuerich").as_deref(), Some("osm:node:1"));
+        assert_eq!(geocode("Zurich").as_deref(), Some("osm:node:1"));
+        assert_eq!(geocode("Zug"), None);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
