@@ -11,7 +11,9 @@ use tantivy::{
     Index, IndexReader, Score, Term,
     collector::TopDocs,
     columnar::Column,
-    query::{BooleanQuery, Occur, PhrasePrefixQuery, Query, QueryParser, TermQuery},
+    query::{
+        BooleanQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery, Query, QueryParser, TermQuery,
+    },
     schema::{Field, IndexRecordOption},
 };
 
@@ -35,6 +37,13 @@ pub struct PackTextSearcher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidQuery {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    Strict,
+    Fuzzy,
+    Relaxed,
 }
 
 impl fmt::Display for InvalidQuery {
@@ -181,9 +190,16 @@ impl PackTextSearcher {
             .into());
         }
 
-        let (_, hits) =
-            self.search_variants(query_text, options.layer.as_deref(), limit, |_| Ok(true))?;
-        Ok(hits)
+        for mode in [MatchMode::Strict, MatchMode::Fuzzy, MatchMode::Relaxed] {
+            let (_, hits) =
+                self.search_variants(query_text, options.layer.as_deref(), limit, mode, |_| {
+                    Ok(true)
+                })?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        Ok(Vec::new())
     }
 
     pub fn geocode_address(
@@ -215,19 +231,27 @@ impl PackTextSearcher {
             limit
         };
 
-        for candidate in address_geocode_candidates(address, options.postcode.as_deref()) {
-            let (query, hits) =
-                self.search_variants(&candidate, options.layer.as_deref(), window, |hit| {
-                    Ok(hit.record.point.is_some()
-                        && self.hit_matches_address_context(
-                            hit,
-                            &desired,
-                            false,
-                            &mut context_labels,
-                        )?)
-                })?;
-            if let Some(hit) = hits.into_iter().next() {
-                return AddressGeocodeHit::new(query, hit).map(Some);
+        let candidates = address_geocode_candidates(address, options.postcode.as_deref());
+        for mode in [MatchMode::Strict, MatchMode::Fuzzy, MatchMode::Relaxed] {
+            for candidate in &candidates {
+                let (query, hits) = self.search_variants(
+                    candidate,
+                    options.layer.as_deref(),
+                    window,
+                    mode,
+                    |hit| {
+                        Ok(hit.record.point.is_some()
+                            && self.hit_matches_address_context(
+                                hit,
+                                &desired,
+                                false,
+                                &mut context_labels,
+                            )?)
+                    },
+                )?;
+                if let Some(hit) = hits.into_iter().next() {
+                    return AddressGeocodeHit::new(query, hit).map(Some);
+                }
             }
         }
 
@@ -261,6 +285,7 @@ impl PackTextSearcher {
             &street,
             Some(Layer::Street.as_str()),
             STREET_FALLBACK_LIMIT,
+            MatchMode::Strict,
             |hit| {
                 if found
                     || hit.record.point.is_none()
@@ -297,7 +322,17 @@ impl PackTextSearcher {
             return Ok(Vec::new());
         }
 
-        let Some(query) = self.build_autocomplete_query(&query_text, options.layer.as_deref())?
+        if let Some(query) = self.build_autocomplete_query(&query_text, options.layer.as_deref())? {
+            let hits = self
+                .ranked_hits(&query, &query_text, limit)
+                .with_context(|| format!("failed to autocomplete text index for {query_text:?}"))?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+
+        let Some(query) =
+            self.build_tolerant_autocomplete_query(&query_text, options.layer.as_deref())
         else {
             return Ok(Vec::new());
         };
@@ -327,6 +362,83 @@ impl PackTextSearcher {
         ])))
     }
 
+    fn build_tolerant_query(
+        &self,
+        query_text: &str,
+        layer: Option<&str>,
+        relaxed: bool,
+    ) -> Result<Option<Box<dyn Query>>> {
+        let mut number_clauses = Vec::new();
+        let mut other_clauses = Vec::new();
+
+        for token in query_text.split_whitespace() {
+            let exact_query =
+                self.query_parser
+                    .parse_query(token)
+                    .map_err(|error| InvalidQuery {
+                        message: format!("failed to parse search query {query_text:?}: {error}"),
+                    })?;
+            let starts_with_digit = is_address_number_token(token);
+            let token_length = token.chars().count();
+            let clause = if starts_with_digit || token_length < 4 {
+                exact_query
+            } else {
+                let distance = if token_length < 8 { 1 } else { 2 };
+                let fuzzy_query = FuzzyTermQuery::new(
+                    Term::from_field_text(self.fields.content_text, token),
+                    distance,
+                    true,
+                );
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Should, exact_query),
+                    (Occur::Should, Box::new(fuzzy_query)),
+                ])) as Box<dyn Query>
+            };
+            if starts_with_digit {
+                number_clauses.push((Occur::Must, clause));
+            } else {
+                other_clauses.push(clause);
+            }
+        }
+
+        if relaxed && other_clauses.len() < 3 {
+            return Ok(None);
+        }
+
+        let mut subqueries = number_clauses;
+        if relaxed {
+            let minimum_required = other_clauses.len() - 1;
+            let clauses = other_clauses
+                .into_iter()
+                .map(|clause| (Occur::Should, clause))
+                .collect();
+            subqueries.push((
+                Occur::Must,
+                Box::new(BooleanQuery::with_minimum_required_clauses(
+                    clauses,
+                    minimum_required,
+                )),
+            ));
+        } else {
+            subqueries.extend(
+                other_clauses
+                    .into_iter()
+                    .map(|clause| (Occur::Must, clause)),
+            );
+        }
+
+        if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+            subqueries.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.layer, layer),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+    }
+
     /// Try the query as written, then normalized and expanded rewrites, and
     /// return the first variant with hits that `accept` keeps. A variant whose
     /// hits are all rejected falls through to the next one. Fails only when no
@@ -336,15 +448,26 @@ impl PackTextSearcher {
         query_text: &str,
         layer: Option<&str>,
         limit: usize,
+        mode: MatchMode,
         mut accept: impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut last_query = query_text.trim().to_string();
         let mut parse_error = None;
         let mut parsed_any = false;
-        for variant in search_query_variants(query_text) {
+        let variants = match mode {
+            MatchMode::Strict => search_query_variants(query_text),
+            MatchMode::Fuzzy | MatchMode::Relaxed => tolerant_search_query_variants(query_text),
+        };
+        for variant in variants {
             last_query = variant.clone();
-            let query = match self.build_query(&variant, layer) {
-                Ok(query) => query,
+            let query = match mode {
+                MatchMode::Strict => self.build_query(&variant, layer).map(Some),
+                MatchMode::Fuzzy => self.build_tolerant_query(&variant, layer, false),
+                MatchMode::Relaxed => self.build_tolerant_query(&variant, layer, true),
+            };
+            let query = match query {
+                Ok(Some(query)) => query,
+                Ok(None) => continue,
                 Err(error) => {
                     parse_error = Some(error);
                     continue;
@@ -542,6 +665,133 @@ impl PackTextSearcher {
         }
 
         Ok(Some(Box::new(BooleanQuery::new(subqueries))))
+    }
+
+    fn build_tolerant_autocomplete_query(
+        &self,
+        query_text: &str,
+        layer: Option<&str>,
+    ) -> Option<Box<dyn Query>> {
+        let mut tokens = autocomplete_query_tokens(query_text);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut subqueries = Vec::new();
+        if tokens.len() > 1 && is_address_number_token(&tokens[0]) {
+            subqueries.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.address_number, &tokens[0]),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ));
+            tokens.remove(0);
+        }
+
+        let final_token = tokens.pop();
+        let final_prefix = final_token
+            .as_deref()
+            .filter(|token| token.chars().count() >= 2);
+        if tokens.is_empty() && final_prefix.is_none() {
+            return None;
+        }
+
+        let mut anchor_queries = Vec::new();
+        for token in &tokens {
+            let mut token_queries = vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                ),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.content_text, token),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                ),
+            ];
+            if token.chars().count() >= 4 {
+                token_queries.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new(
+                        Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                        1,
+                        true,
+                    )),
+                ));
+                token_queries.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new(
+                        Term::from_field_text(self.fields.content_text, token),
+                        1,
+                        true,
+                    )),
+                ));
+            }
+            subqueries.push((
+                Occur::Must,
+                Box::new(BooleanQuery::new(token_queries)) as Box<dyn Query>,
+            ));
+            anchor_queries.push((
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ));
+        }
+
+        if let Some(token) = final_prefix {
+            subqueries.push((
+                Occur::Must,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Should,
+                        Box::new(FuzzyTermQuery::new_prefix(
+                            Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                            0,
+                            true,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(FuzzyTermQuery::new_prefix(
+                            Term::from_field_text(self.fields.content_text, token),
+                            0,
+                            true,
+                        )) as Box<dyn Query>,
+                    ),
+                ])) as Box<dyn Query>,
+            ));
+            anchor_queries.push((
+                Occur::Should,
+                Box::new(FuzzyTermQuery::new_prefix(
+                    Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                    0,
+                    true,
+                )) as Box<dyn Query>,
+            ));
+        }
+
+        if anchor_queries.is_empty() {
+            return None;
+        }
+        subqueries.push((Occur::Must, Box::new(BooleanQuery::new(anchor_queries))));
+        if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
+            subqueries.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.layer, layer),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        Some(Box::new(BooleanQuery::new(subqueries)))
     }
 
     /// The best `limit` hits. Hits whose score ties the cutoff are ordered by
@@ -745,6 +995,20 @@ fn search_query_variants(query_text: &str) -> Vec<String> {
     if let Some(cleaned) = collapse_query(query_text) {
         variants.push(cleaned);
     }
+    if let Some(normalized) = normalize_index_text(query_text) {
+        variants.push(normalized.clone());
+        let expanded = expand_address_abbreviations(&normalized);
+        variants.push(expanded.clone());
+        variants.extend(unit_query(&expanded));
+        if let Some(without_unit) = strip_unit_terms(&expanded) {
+            variants.push(without_unit);
+        }
+    }
+    unique_strings(variants)
+}
+
+fn tolerant_search_query_variants(query_text: &str) -> Vec<String> {
+    let mut variants = Vec::new();
     if let Some(normalized) = normalize_index_text(query_text) {
         variants.push(normalized.clone());
         let expanded = expand_address_abbreviations(&normalized);
@@ -978,6 +1242,256 @@ mod tests {
         let variants = search_query_variants("St Clair Ave W");
         assert!(variants.contains(&"st clair avenue west".to_string()));
         assert!(!variants.contains(&"street clair avenue west".to_string()));
+    }
+
+    #[test]
+    fn search_and_autocomplete_match_accented_names_in_both_directions() {
+        let temp_dir = temp_pack_path("accent-folding");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, street) in [
+            ("osm:node:1", "Rue de la Liberté"),
+            ("osm:node:2", "Rue de la Liberte"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", "12", street, Some("Luxembourg"), None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for query in ["Rue de la Liberté", "Rue de la Liberte"] {
+            let hits = searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("search");
+            let ids = hits
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(ids.contains("osm:node:1"), "{query}");
+            assert!(ids.contains("osm:node:2"), "{query}");
+
+            let hits = searcher
+                .autocomplete(TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("autocomplete");
+            let ids = hits
+                .iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(ids.contains("osm:node:1"), "{query}");
+            assert!(ids.contains("osm:node:2"), "{query}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fuzzy_search_falls_back_after_strict_and_keeps_numbers_exact() {
+        let temp_dir = temp_pack_path("fuzzy-search");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, number, street) in [
+            ("osm:node:1", "12", "Rue Haute"),
+            ("osm:node:2", "13", "Rue Haute"),
+            ("osm:node:3", "21", "Rue Haute"),
+            ("osm:node:4", "99", "Rue Hautte"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, Some("Luxembourg"), None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for variant in search_query_variants("12 rue hautte") {
+            let query = searcher.build_query(&variant, None).expect("strict query");
+            assert!(
+                searcher
+                    .ranked_hits(&query, &variant, 10)
+                    .expect("strict hits")
+                    .is_empty(),
+                "strict variant {variant:?} unexpectedly matched"
+            );
+        }
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "12 rue hautte".to_string(),
+                limit: 10,
+                layer: None,
+            })
+            .expect("fuzzy search");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["osm:node:1"]
+        );
+
+        let tolerant_query = searcher
+            .build_tolerant_query("rue hautte", None, false)
+            .expect("tolerant query")
+            .expect("query");
+        let hits = searcher
+            .ranked_hits(&tolerant_query, "rue hautte", 10)
+            .expect("tolerant hits");
+        assert_eq!(hits[0].record.id, "osm:node:4");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn relaxed_search_allows_one_unmatched_word_only_for_three_or_more() {
+        let temp_dir = temp_pack_path("relaxed-search");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "12",
+                    "Rue Haute",
+                    Some("Luxembourg"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "rue haute luxemburgx foo".to_string(),
+                limit: 10,
+                layer: None,
+            })
+            .expect("relaxed search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, "osm:node:1");
+        assert!(
+            searcher
+                .search(TextSearchOptions {
+                    query: "rue foo".to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("two-word search")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fuzzy_geocode_still_rejects_wrong_locality_and_postcode() {
+        let temp_dir = temp_pack_path("fuzzy-geocode-context");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "10",
+                    "King Street",
+                    Some("Toronto"),
+                    Some("M5V 1A1"),
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "10 Kinng Street", Some("Toronto"), None).as_deref(),
+            Some("osm:node:1")
+        );
+        assert_eq!(
+            geocode(&searcher, "10 Kinng Street", Some("Ottawa"), None),
+            None
+        );
+        assert_eq!(
+            geocode(&searcher, "10 Kinng Street", None, Some("K7L 1A1")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn tolerant_autocomplete_uses_town_tokens_and_anchors_street_subject() {
+        let temp_dir = temp_pack_path("tolerant-autocomplete");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        for (id, number, street, locality) in [
+            ("osm:node:1", "12", "Rue Haute", "Luxembourg"),
+            ("osm:node:2", "13", "Rue Haute", "Esch-sur-Alzette"),
+            ("osm:node:3", "14", "Rue de la Liberté", "Luxembourg"),
+        ] {
+            writer
+                .write(
+                    &address_record(id, "", number, street, Some(locality), None).into(),
+                    None,
+                )
+                .expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        for query in [
+            "rue haute luxem",
+            "rue haute, luxembourg",
+            "rue hautte luxem",
+        ] {
+            let hits = searcher
+                .autocomplete(TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("town autocomplete");
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.record.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["osm:node:1"],
+                "{query}"
+            );
+        }
+
+        let hits = searcher
+            .autocomplete(TextAutocompleteOptions {
+                query: "rue liberte".to_string(),
+                limit: 10,
+                layer: None,
+            })
+            .expect("accented street autocomplete");
+        assert!(hits.iter().any(|hit| hit.record.id == "osm:node:3"));
+        assert!(
+            searcher
+                .autocomplete(TextAutocompleteOptions {
+                    query: "luxembourg".to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("locality-only autocomplete")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
