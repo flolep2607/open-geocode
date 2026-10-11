@@ -30,6 +30,8 @@ pub struct PackTextSearcher {
     reader: IndexReader,
     fields: TextIndexFields,
     query_parser: QueryParser,
+    #[cfg(test)]
+    ranked_hits_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// A query the text index cannot run: blank, or rejected by the query parser.
@@ -172,6 +174,8 @@ impl PackTextSearcher {
             reader,
             fields,
             query_parser,
+            #[cfg(test)]
+            ranked_hits_calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -189,11 +193,16 @@ impl PackTextSearcher {
             .into());
         }
 
+        let mut tried_fuzzy_variants = HashSet::new();
         for mode in [MatchMode::Strict, MatchMode::Fuzzy] {
-            let (_, hits) =
-                self.search_variants(query_text, options.layer.as_deref(), limit, mode, |_| {
-                    Ok(true)
-                })?;
+            let (_, hits) = self.search_variants(
+                query_text,
+                options.layer.as_deref(),
+                limit,
+                mode,
+                &mut tried_fuzzy_variants,
+                |_| Ok(true),
+            )?;
             if !hits.is_empty() {
                 return Ok(hits);
             }
@@ -231,6 +240,7 @@ impl PackTextSearcher {
         };
 
         let candidates = address_geocode_candidates(address, options.postcode.as_deref());
+        let mut tried_fuzzy_variants = HashSet::new();
         for mode in [MatchMode::Strict, MatchMode::Fuzzy] {
             for candidate in &candidates {
                 let (query, hits) = self.search_variants(
@@ -238,6 +248,7 @@ impl PackTextSearcher {
                     options.layer.as_deref(),
                     window,
                     mode,
+                    &mut tried_fuzzy_variants,
                     |hit| {
                         Ok(hit.record.point.is_some()
                             && self.hit_matches_address_context(
@@ -280,11 +291,13 @@ impl PackTextSearcher {
 
         // Hits are ranked best first, so the first one in the area is the answer.
         let mut found = false;
+        let mut tried_fuzzy_variants = HashSet::new();
         let (query, hits) = self.search_variants(
             &street,
             Some(Layer::Street.as_str()),
             STREET_FALLBACK_LIMIT,
             MatchMode::Strict,
+            &mut tried_fuzzy_variants,
             |hit| {
                 if found
                     || hit.record.point.is_none()
@@ -331,7 +344,7 @@ impl PackTextSearcher {
         }
 
         let Some(query) =
-            self.build_tolerant_autocomplete_query(&query_text, options.layer.as_deref())
+            self.build_tolerant_autocomplete_query(&query_text, options.layer.as_deref())?
         else {
             return Ok(Vec::new());
         };
@@ -365,8 +378,10 @@ impl PackTextSearcher {
         &self,
         query_text: &str,
         layer: Option<&str>,
-    ) -> Result<Box<dyn Query>> {
+    ) -> Result<Option<Box<dyn Query>>> {
         let mut subqueries = Vec::new();
+        let mut fuzzed_any = false;
+        let searcher = self.reader.searcher();
 
         for token in query_text.split_whitespace() {
             let exact_query =
@@ -380,18 +395,24 @@ impl PackTextSearcher {
             let clause = if starts_with_digit || token_length < 4 {
                 exact_query
             } else {
-                let distance = if token_length < 8 { 1 } else { 2 };
-                let fuzzy_query = FuzzyTermQuery::new(
-                    Term::from_field_text(self.fields.content_text, token),
-                    distance,
-                    true,
-                );
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Should, exact_query),
-                    (Occur::Should, Box::new(fuzzy_query)),
-                ])) as Box<dyn Query>
+                let term = Term::from_field_text(self.fields.content_text, token);
+                if searcher.doc_freq(&term)? > 0 {
+                    exact_query
+                } else {
+                    fuzzed_any = true;
+                    let distance = if token_length < 8 { 1 } else { 2 };
+                    let fuzzy_query = FuzzyTermQuery::new(term, distance, true);
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Should, exact_query),
+                        (Occur::Should, Box::new(fuzzy_query)),
+                    ])) as Box<dyn Query>
+                }
             };
             subqueries.push((Occur::Must, clause));
+        }
+
+        if !fuzzed_any {
+            return Ok(None);
         }
 
         if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
@@ -403,7 +424,7 @@ impl PackTextSearcher {
                 )),
             ));
         }
-        Ok(Box::new(BooleanQuery::new(subqueries)))
+        Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
 
     /// Try the query as written, then normalized and expanded rewrites, and
@@ -416,6 +437,7 @@ impl PackTextSearcher {
         layer: Option<&str>,
         limit: usize,
         mode: MatchMode,
+        tried_fuzzy_variants: &mut HashSet<String>,
         mut accept: impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut last_query = query_text.trim().to_string();
@@ -427,12 +449,16 @@ impl PackTextSearcher {
         };
         for variant in variants {
             last_query = variant.clone();
+            if mode == MatchMode::Fuzzy && !tried_fuzzy_variants.insert(variant.clone()) {
+                continue;
+            }
             let query = match mode {
-                MatchMode::Strict => self.build_query(&variant, layer),
+                MatchMode::Strict => self.build_query(&variant, layer).map(Some),
                 MatchMode::Fuzzy => self.build_tolerant_query(&variant, layer),
             };
             let query = match query {
-                Ok(query) => query,
+                Ok(Some(query)) => query,
+                Ok(None) => continue,
                 Err(error) => {
                     parse_error = Some(error);
                     continue;
@@ -635,13 +661,14 @@ impl PackTextSearcher {
         &self,
         query_text: &str,
         layer: Option<&str>,
-    ) -> Option<Box<dyn Query>> {
+    ) -> Result<Option<Box<dyn Query>>> {
         let mut tokens = autocomplete_query_tokens(query_text);
         if tokens.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let mut subqueries = Vec::new();
+        let searcher = self.reader.searcher();
         if tokens.len() > 1 && is_address_number_token(&tokens[0]) {
             subqueries.push((
                 Occur::Must,
@@ -658,43 +685,40 @@ impl PackTextSearcher {
             .as_deref()
             .filter(|token| token.chars().count() >= 2);
         if tokens.is_empty() && final_prefix.is_none() {
-            return None;
+            return Ok(None);
         }
 
         let mut anchor_queries = Vec::new();
         for token in &tokens {
+            let subject_term = Term::from_field_text(self.fields.autocomplete_subject_text, token);
+            let content_term = Term::from_field_text(self.fields.content_text, token);
             let mut token_queries = vec![
                 (
                     Occur::Should,
                     Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.autocomplete_subject_text, token),
+                        subject_term.clone(),
                         IndexRecordOption::Basic,
                     )) as Box<dyn Query>,
                 ),
                 (
                     Occur::Should,
                     Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.content_text, token),
+                        content_term.clone(),
                         IndexRecordOption::Basic,
                     )) as Box<dyn Query>,
                 ),
             ];
-            if token.chars().count() >= 4 {
+            if token.chars().count() >= 4
+                && searcher.doc_freq(&subject_term)? == 0
+                && searcher.doc_freq(&content_term)? == 0
+            {
                 token_queries.push((
                     Occur::Should,
-                    Box::new(FuzzyTermQuery::new(
-                        Term::from_field_text(self.fields.autocomplete_subject_text, token),
-                        1,
-                        true,
-                    )),
+                    Box::new(FuzzyTermQuery::new(subject_term, 1, true)),
                 ));
                 token_queries.push((
                     Occur::Should,
-                    Box::new(FuzzyTermQuery::new(
-                        Term::from_field_text(self.fields.content_text, token),
-                        1,
-                        true,
-                    )),
+                    Box::new(FuzzyTermQuery::new(content_term, 1, true)),
                 ));
             }
             subqueries.push((
@@ -743,7 +767,7 @@ impl PackTextSearcher {
         }
 
         if anchor_queries.is_empty() {
-            return None;
+            return Ok(None);
         }
         subqueries.push((Occur::Must, Box::new(BooleanQuery::new(anchor_queries))));
         if let Some(layer) = layer.map(str::trim).filter(|layer| !layer.is_empty()) {
@@ -755,7 +779,7 @@ impl PackTextSearcher {
                 )),
             ));
         }
-        Some(Box::new(BooleanQuery::new(subqueries)))
+        Ok(Some(Box::new(BooleanQuery::new(subqueries))))
     }
 
     /// The best `limit` hits. Hits whose score ties the cutoff are ordered by
@@ -767,6 +791,10 @@ impl PackTextSearcher {
         query_text: &str,
         limit: usize,
     ) -> Result<Vec<TextSearchHit>> {
+        #[cfg(test)]
+        self.ranked_hits_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let searcher = self.reader.searcher();
         let window = limit
             .saturating_mul(RANK_WINDOW_FACTOR)
@@ -1278,7 +1306,6 @@ mod tests {
             ("osm:node:1", "12", "Rue Haute"),
             ("osm:node:2", "13", "Rue Haute"),
             ("osm:node:3", "21", "Rue Haute"),
-            ("osm:node:4", "99", "Rue Hautte"),
         ] {
             writer
                 .write(
@@ -1316,11 +1343,139 @@ mod tests {
 
         let tolerant_query = searcher
             .build_tolerant_query("rue hautte", None)
-            .expect("tolerant query");
+            .expect("tolerant query")
+            .expect("unknown token should be fuzzed");
         let hits = searcher
             .ranked_hits(&tolerant_query, "rue hautte", 10)
             .expect("tolerant hits");
-        assert_eq!(hits[0].record.id, "osm:node:4");
+        assert!(hits.iter().any(|hit| hit.record.id == "osm:node:1"));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fuzzy_search_fuzzes_only_tokens_missing_from_the_index() {
+        let temp_dir = temp_pack_path("fuzzy-only-unknown-tokens");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "12",
+                    "Rue Haute",
+                    Some("Luxembourg"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("write Rue Haute");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:2",
+                    "",
+                    "1",
+                    "Hautcharage",
+                    Some("Hautcharage"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("write Hautcharage");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let query = searcher
+            .build_tolerant_query("rue hautte luxembourg", None)
+            .expect("tolerant query")
+            .expect("unknown token should be fuzzed");
+        let query_debug = format!("{query:?}");
+        assert_eq!(
+            query_debug.matches("FuzzyTermQuery").count(),
+            1,
+            "{query_debug}"
+        );
+        let fuzzy_clause = query_debug
+            .split("FuzzyTermQuery")
+            .nth(1)
+            .expect("one fuzzy clause");
+        assert!(fuzzy_clause.contains("\"hautte\""), "{query_debug}");
+
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "rue hautte luxembourg".to_string(),
+                limit: 10,
+                layer: None,
+            })
+            .expect("fuzzy search");
+        assert_eq!(hits[0].record.id, "osm:node:1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fully_known_tokens_do_not_repeat_a_strict_miss_in_fuzzy_mode() {
+        let temp_dir = temp_pack_path("fuzzy-known-tokens");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "12",
+                    "Rue Haute",
+                    Some("Luxembourg"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("write Rue Haute");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:2",
+                    "",
+                    "1",
+                    "Hautcharage",
+                    Some("Hautcharage"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("write Hautcharage");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let query = "rue haute hautcharage";
+
+        assert!(
+            searcher
+                .build_tolerant_query(query, None)
+                .expect("tolerant query")
+                .is_none()
+        );
+        assert!(
+            searcher
+                .search(TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 10,
+                    layer: None,
+                })
+                .expect("search")
+                .is_empty()
+        );
+        assert_eq!(
+            searcher
+                .ranked_hits_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            search_query_variants(query).len()
+        );
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -1549,6 +1704,12 @@ mod tests {
         }
         writer.finish().expect("finish");
         let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+
+        let query = searcher
+            .build_tolerant_autocomplete_query("rue haute luxem", None)
+            .expect("tolerant autocomplete query")
+            .expect("autocomplete query");
+        assert_eq!(format!("{query:?}").matches("FuzzyTermQuery").count(), 3);
 
         for query in [
             "rue haute luxem",
