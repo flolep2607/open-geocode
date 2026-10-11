@@ -28,6 +28,8 @@ pub struct PackTextSearcher {
     reader: IndexReader,
     fields: TextIndexFields,
     query_parser: QueryParser,
+    #[cfg(test)]
+    ranked_hits_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// A query the text index cannot run: blank, or rejected by the query parser.
@@ -116,6 +118,12 @@ impl DesiredContext {
 /// for one geocode request: admin ids repeat across hits in the same town.
 type ContextLabels = HashMap<RecordId, Option<(Option<String>, Option<String>)>>;
 
+#[derive(Hash, PartialEq, Eq)]
+struct RankedQueryKey {
+    query: String,
+    ranking_tokens: Vec<String>,
+}
+
 impl AddressGeocodeHit {
     fn new(query: String, hit: TextSearchHit) -> Result<Self> {
         let match_level = Layer::parse(&hit.record.layer)
@@ -164,6 +172,8 @@ impl PackTextSearcher {
             reader,
             fields,
             query_parser,
+            #[cfg(test)]
+            ranked_hits_calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -181,8 +191,14 @@ impl PackTextSearcher {
             .into());
         }
 
-        let (_, hits) =
-            self.search_variants(query_text, options.layer.as_deref(), limit, |_| Ok(true))?;
+        let mut tried = HashSet::new();
+        let (_, hits) = self.search_variants(
+            query_text,
+            options.layer.as_deref(),
+            limit,
+            &mut tried,
+            |_| Ok(true),
+        )?;
         Ok(hits)
     }
 
@@ -214,10 +230,15 @@ impl PackTextSearcher {
         } else {
             limit
         };
+        let mut tried = HashSet::new();
 
         for candidate in address_geocode_candidates(address, options.postcode.as_deref()) {
-            let (query, hits) =
-                self.search_variants(&candidate, options.layer.as_deref(), window, |hit| {
+            let (query, hits) = self.search_variants(
+                &candidate,
+                options.layer.as_deref(),
+                window,
+                &mut tried,
+                |hit| {
                     Ok(hit.record.point.is_some()
                         && self.hit_matches_address_context(
                             hit,
@@ -225,7 +246,8 @@ impl PackTextSearcher {
                             false,
                             &mut context_labels,
                         )?)
-                })?;
+                },
+            )?;
             if let Some(hit) = hits.into_iter().next() {
                 return AddressGeocodeHit::new(query, hit).map(Some);
             }
@@ -257,10 +279,12 @@ impl PackTextSearcher {
 
         // Hits are ranked best first, so the first one in the area is the answer.
         let mut found = false;
+        let mut tried = HashSet::new();
         let (query, hits) = self.search_variants(
             &street,
             Some(Layer::Street.as_str()),
             STREET_FALLBACK_LIMIT,
+            &mut tried,
             |hit| {
                 if found
                     || hit.record.point.is_none()
@@ -336,6 +360,7 @@ impl PackTextSearcher {
         query_text: &str,
         layer: Option<&str>,
         limit: usize,
+        tried: &mut HashSet<RankedQueryKey>,
         mut accept: impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let mut last_query = query_text.trim().to_string();
@@ -351,6 +376,9 @@ impl PackTextSearcher {
                 }
             };
             parsed_any = true;
+            if !tried.insert(ranked_query_key(query.as_ref(), &variant)) {
+                continue;
+            }
             let mut hits = Vec::new();
             for hit in self
                 .ranked_hits(&query, &variant, limit)
@@ -553,6 +581,10 @@ impl PackTextSearcher {
         query_text: &str,
         limit: usize,
     ) -> Result<Vec<TextSearchHit>> {
+        #[cfg(test)]
+        self.ranked_hits_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let searcher = self.reader.searcher();
         let window = limit
             .saturating_mul(RANK_WINDOW_FACTOR)
@@ -565,13 +597,7 @@ impl PackTextSearcher {
             top_docs.retain(|(score, _)| *score >= cutoff);
         }
 
-        let query_tokens = normalize_index_text(query_text)
-            .map(|text| {
-                text.split_whitespace()
-                    .map(str::to_string)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let query_tokens = ranked_query_tokens(query_text);
         let mut record_ids: HashMap<u32, Column<u64>> = HashMap::new();
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -607,6 +633,27 @@ impl PackTextSearcher {
         hits.truncate(limit);
         Ok(hits.into_iter().map(|(_, hit)| hit).collect())
     }
+}
+
+fn ranked_query_key(query: &dyn Query, query_text: &str) -> RankedQueryKey {
+    let mut ranking_tokens = ranked_query_tokens(query_text)
+        .into_iter()
+        .collect::<Vec<_>>();
+    ranking_tokens.sort_unstable();
+    RankedQueryKey {
+        query: format!("{query:?}"),
+        ranking_tokens,
+    }
+}
+
+fn ranked_query_tokens(query_text: &str) -> HashSet<String> {
+    normalize_index_text(query_text)
+        .map(|text| {
+            text.split_whitespace()
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn text_query_parser(index: &Index, fields: &TextIndexFields) -> QueryParser {
@@ -1807,6 +1854,42 @@ mod tests {
         assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.id, "osm:node:1");
         assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn search_variants_skip_candidates_with_duplicate_queries() {
+        let temp_dir = temp_pack_path("search-duplicate-variants");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record("osm:node:1", "", "99", "Other Road", None, None).into(),
+                None,
+            )
+            .expect("write unrelated address");
+        writer.finish().expect("finish");
+
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        assert_eq!(
+            normalize_index_text("rue x 1"),
+            normalize_index_text("rue   x 1")
+        );
+        let mut tried = HashSet::new();
+        for candidate in ["rue x 1", "rue   x 1"] {
+            let (_, hits) = searcher
+                .search_variants(candidate, None, 5, &mut tried, |_| Ok(true))
+                .expect("search variants");
+            assert!(hits.is_empty());
+        }
+        assert_eq!(
+            searcher
+                .ranked_hits_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
