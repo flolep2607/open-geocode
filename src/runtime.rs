@@ -150,11 +150,21 @@ struct GeocodeParams {
     locality: Option<String>,
     region: Option<String>,
     postcode: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     limit: usize,
     layer: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     street_fallback: bool,
+}
+
+/// A field that is its default when absent or `null`, as the `Option` fields are. A batch item
+/// is JSON, where a client serialising an unset value sends `null`; a query string cannot.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl GeocodeParams {
@@ -1154,6 +1164,20 @@ mod router_tests {
         )
         .await;
         assert_eq!(results[0], get.json());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_reads_a_null_field_as_an_absent_one() {
+        let (router, pack) = batch_router("batch-null");
+        let items = serde_json::json!({ "items": [{
+            "address": "10 King Street", "locality": null, "region": null, "postcode": null,
+            "layer": null, "limit": null, "street_fallback": null,
+        }]});
+        let reply = send(router, post("/geocode/batch", items.to_string())).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["results"][0]["result"]["layer"], "address");
 
         let _ = std::fs::remove_dir_all(&pack);
     }
