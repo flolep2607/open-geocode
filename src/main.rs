@@ -1,4 +1,6 @@
-use std::{fs::File, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    fs::File, io::IsTerminal, net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -11,7 +13,7 @@ use open_geocode::{
     pack::{PackReader, RecordId},
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions},
     route::{RouteOptions, route},
-    runtime::{ServeOptions, serve},
+    runtime::{ServeOptions, default_max_concurrency, serve},
     search::{PackTextSearcher, TextSearchOptions},
 };
 
@@ -51,7 +53,8 @@ enum Commands {
         /// OpenAddresses-format CSV of extra addresses (LON, LAT, NUMBER,
         /// STREET required; UNIT, CITY, REGION, POSTCODE optional), as
         /// `dataset=path` or `path` (the file stem names the dataset). Records
-        /// get the id `dataset:row`. Repeat for several files.
+        /// get the id `dataset:row`. Rows matching an OSM address with the
+        /// same street and number within 150 m are skipped. Repeat for files.
         #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
         addresses: Vec<AddressFile>,
     },
@@ -179,13 +182,19 @@ enum Commands {
         /// file is absent, so the demo still runs without a local basemap.
         #[arg(long, default_value = "data/ontario.pmtiles")]
         basemap: PathBuf,
+
+        /// API requests processed at once (default: the number of CPUs). A request that
+        /// waits more than 2 s for a slot gets 503 with Retry-After.
+        #[arg(long, default_value_t = default_max_concurrency())]
+        max_concurrency: NonZeroUsize,
     },
     /// Serve one HTTP entry point in front of one Runtime per country Pack.
     ///
     /// Requests with `country=XX` go to that country's Runtime. Without it the router picks the
     /// country whose Pack holds the request's street (each Runtime serves a membership filter at
     /// /routing-filter) and, when that is not decided, asks every Runtime: /search and
-    /// /autocomplete results are merged by score, /geocode keeps the one found address.
+    /// /autocomplete results are merged (labels that cover more of the query first, then each
+    /// Runtime's own ranking, interleaved), /geocode keeps the one found address.
     Route {
         /// A Runtime as COUNTRY=URL, e.g. NZ=http://127.0.0.1:8081. Repeat per country.
         #[arg(long = "worker", required = true)]
@@ -347,12 +356,15 @@ async fn main() -> Result<()> {
             demo,
             bind,
             basemap,
+            max_concurrency,
         } => {
+            init_tracing();
             serve(ServeOptions {
                 pack,
                 demo,
                 bind,
                 basemap,
+                max_concurrency: max_concurrency.get(),
             })
             .await
         }
@@ -361,6 +373,7 @@ async fn main() -> Result<()> {
             bind,
             filter_refresh_secs,
         } => {
+            init_tracing();
             let workers = workers
                 .into_iter()
                 .map(|w| match w.split_once('=') {
@@ -376,6 +389,18 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+/// Logs for the long-running `serve` and `route`, on stderr, filtered by `RUST_LOG` (default
+/// `info`). The other commands keep their plain stdout output.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
 }
 
 fn inspect_pack(

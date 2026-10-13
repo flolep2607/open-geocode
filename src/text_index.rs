@@ -23,7 +23,9 @@ use tantivy::{
     indexer::UserOperation,
     merge_policy::NoMergePolicy,
     schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
+    tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer},
 };
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::{
     container::{Bytes, Container, ContainerWriter},
@@ -39,7 +41,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 5;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 6;
 
 /// Tantivy needs at least 15 MB per indexing thread (it uses fewer threads
 /// when given less) and gains little beyond 1.6 GB.
@@ -119,6 +121,7 @@ impl TextIndexWriter {
             .with_context(|| format!("failed to create {}", path.display()))?;
         let index = Index::create_in_dir(&path, schema)
             .with_context(|| format!("failed to create Tantivy index {}", path.display()))?;
+        register_folded_tokenizer(&index);
         Ok(Self {
             writer: None,
             budget: Arc::clone(budget),
@@ -343,7 +346,10 @@ impl TextIndexDocument {
 }
 
 pub fn open_text_index(container: &Container) -> Result<Index> {
-    Index::open(PackDirectory::new(container)?).context("failed to open the Pack text index")
+    let index = Index::open(PackDirectory::new(container)?)
+        .context("failed to open the Pack text index")?;
+    register_folded_tokenizer(&index);
+    Ok(index)
 }
 
 /// Read-only Tantivy directory over the `text/` sections of a Pack. Writes the
@@ -459,7 +465,7 @@ fn build_schema() -> (Schema, TextIndexFields) {
 fn searchable_text_options() -> TextOptions {
     TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("default")
+            .set_tokenizer("og_folded")
             .set_index_option(IndexRecordOption::WithFreqs)
             .set_fieldnorms(false),
     )
@@ -468,10 +474,21 @@ fn searchable_text_options() -> TextOptions {
 fn autocomplete_subject_text_options() -> TextOptions {
     TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("default")
+            .set_tokenizer("og_folded")
             .set_index_option(IndexRecordOption::WithFreqsAndPositions)
             .set_fieldnorms(false),
     )
+}
+
+fn register_folded_tokenizer(index: &Index) {
+    index.tokenizers().register(
+        "og_folded",
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build(),
+    );
 }
 
 fn exact_string_options() -> TextOptions {
@@ -641,15 +658,27 @@ fn add_normalized_text_if_present(
 pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     let mut normalized = String::with_capacity(value.len());
     let mut previous_was_space = true;
-    for character in value.chars() {
-        if character.is_alphanumeric() {
-            for folded in character.to_lowercase() {
-                normalized.push(folded);
+    for character in value.nfkd() {
+        if is_combining_mark(character) {
+            continue;
+        }
+        let expansion = match character {
+            'ß' | 'ẞ' => Some("ss"),
+            'æ' | 'Æ' => Some("ae"),
+            'œ' | 'Œ' => Some("oe"),
+            'ø' | 'Ø' => Some("o"),
+            'ł' | 'Ł' => Some("l"),
+            'đ' | 'Đ' => Some("d"),
+            'þ' | 'Þ' => Some("th"),
+            'ı' => Some("i"),
+            _ => None,
+        };
+        if let Some(expansion) = expansion {
+            for character in expansion.chars() {
+                push_normalized_character(character, &mut normalized, &mut previous_was_space);
             }
-            previous_was_space = false;
-        } else if !previous_was_space {
-            normalized.push(' ');
-            previous_was_space = true;
+        } else {
+            push_normalized_character(character, &mut normalized, &mut previous_was_space);
         }
     }
     let normalized = normalized.trim().to_string();
@@ -657,6 +686,22 @@ pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
         None
     } else {
         Some(normalized)
+    }
+}
+
+fn push_normalized_character(
+    character: char,
+    normalized: &mut String,
+    previous_was_space: &mut bool,
+) {
+    if character.is_alphanumeric() {
+        for folded in character.to_lowercase() {
+            normalized.push(folded);
+        }
+        *previous_was_space = false;
+    } else if !*previous_was_space {
+        normalized.push(' ');
+        *previous_was_space = true;
     }
 }
 
@@ -735,6 +780,37 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn folded_analyzer_matches_normalized_tokens() {
+        let index = Index::create_in_ram(Schema::builder().build());
+        register_folded_tokenizer(&index);
+        let mut analyzer = index
+            .tokenizers()
+            .get("og_folded")
+            .expect("folded tokenizer");
+
+        for text in [
+            "Avenue de la Liberté",
+            "Bahnhofstraße",
+            "Zürich",
+            "Œuvre Ærø",
+            "Łódź",
+            "Saint-Léger",
+            "Москва",
+            "東京",
+        ] {
+            let normalized = normalize_index_text(text).expect("normalized text");
+            let mut stream = analyzer.token_stream(&normalized);
+            let tokens = std::iter::from_fn(|| stream.next().map(|token| token.text.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tokens,
+                normalized.split_whitespace().collect::<Vec<_>>(),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn projects_address_fields_for_search() {

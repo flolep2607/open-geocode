@@ -60,7 +60,11 @@ pub(crate) const ROUTING_FILTER_SECTION: &str = "routing/filter";
 pub(crate) const ROUTING_FILTER_VERSION: u32 = 1;
 /// Bump with any change to `normalize_index_text`, `expand_address_abbreviations`, the hashes or
 /// the keys a record gives; see the module docs.
-pub(crate) const KEY_SCHEME: u16 = 1;
+///
+/// 1: the first normalization (lower case only) and English abbreviations.
+/// 2: accent folding and transliteration in `normalize_index_text`, French and German street
+///    abbreviations in `expand_address_abbreviations`.
+pub(crate) const KEY_SCHEME: u16 = 2;
 
 /// Fixed forever and stored in the header, so a reader can refuse a filter hashed another way.
 pub(crate) const ROUTING_SEED: u64 = 0x6f67_726f_7574_6531;
@@ -638,6 +642,14 @@ mod tests {
             "Queen Street",
             "Māori Road",
             "Église Street",
+            "Rue de l'Église",
+            "Rue St Jean",
+            "Bd Voltaire",
+            "Av de la Gare",
+            "R Victor Hugo",
+            "Ch des Écoliers",
+            "Hauptstr",
+            "Bahnhofstr",
         ];
         let prefixes = [
             "",
@@ -679,7 +691,7 @@ mod tests {
     #[test]
     fn key_scheme_is_pinned() {
         let street = |text: &str| street_hash(text).expect("street");
-        assert_eq!(KEY_SCHEME, 1);
+        assert_eq!(KEY_SCHEME, 2);
         assert_eq!(street("King Street"), 8_499_246_586_564_395_725);
         assert_eq!(street("King St"), street("king street"));
         assert_eq!(street("St Kilda Rd"), 15_419_769_240_993_744_527);
@@ -689,6 +701,16 @@ mod tests {
             pair_hash(street("King Street"), town_hash("Toronto").unwrap()),
             11_569_134_895_287_790_255
         );
+        // Scheme 2: accents fold, and French and German abbreviations expand. Before it these
+        // streets hashed as "rue de l église" and "bd voltaire", so a Pack built then holds other
+        // keys than a router asking now.
+        assert_eq!(street("Rue de l'Église"), street("rue de l eglise"));
+        assert_eq!(street("Bd Voltaire"), street("Boulevard Voltaire"));
+        assert_eq!(street("Hauptstr"), street("Hauptstraße"));
+        assert_eq!(street("Rue de l'Église"), 6080179909692058134);
+        assert_eq!(street("Bd Voltaire"), 9746736755520892843);
+        assert_eq!(street("Hauptstr"), 16947517068580815846);
+        assert_eq!(town_hash("Zürich"), town_hash("Zurich"));
     }
 
     /// The layout is xorf's descriptor then its fingerprints; this fails loudly if a xorf upgrade
@@ -700,7 +722,7 @@ mod tests {
             .collect();
         let bytes = encode(&keys, 0);
         assert_eq!(bytes.len(), 252);
-        assert_eq!(xxh3_64_with_seed(&bytes, 0), 11_935_176_968_712_116_154);
+        assert_eq!(xxh3_64_with_seed(&bytes, 0), 10_753_183_529_993_147_864);
     }
 
     #[test]
@@ -711,6 +733,10 @@ mod tests {
             "Queen St",
             "5th Ave",
             "Cuba Mall",
+            "Av de la Gare",
+            "Bd Saint-Michel",
+            "Ch des Écoliers",
+            "Hauptstr",
         ] {
             let once = expand_address_abbreviations(&normalize_index_text(street).unwrap());
             assert_eq!(expand_address_abbreviations(&once), once, "{street}");
@@ -798,6 +824,11 @@ mod tests {
         let mut bad = good.clone();
         bad[6] = 9;
         assert!(format!("{:#}", RoutingFilter::parse(bad).unwrap_err()).contains("key scheme 9"));
+        // A Pack built before accent folding and the French and German abbreviations holds other
+        // keys for the same streets, so its filter is refused, not misread.
+        let mut old = good.clone();
+        old[6..8].copy_from_slice(&1u16.to_le_bytes());
+        assert!(format!("{:#}", RoutingFilter::parse(old).unwrap_err()).contains("key scheme 1"));
     }
 
     /// One filter shard blob made by hand: segment length 4, 13 fingerprint bytes.

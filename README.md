@@ -42,6 +42,10 @@ Building the Ontario pack (~940 MB PBF) takes under a minute on a 24-core machin
    cargo run --release -- serve --pack data/pack
    ```
 
+`serve` and `route` log to stderr; set `RUST_LOG` to change the level (default `info`, for example `RUST_LOG=open_geocode=debug,info`).
+On Ctrl-C or SIGTERM both stop accepting connections and exit once the requests in flight have finished; `serve` answers `/readyz` with 503 during that drain.
+`serve --max-concurrency <N>` (default: the number of CPUs) caps the API requests processed at once; a request that waits more than 2 s for a slot gets 503 with `Retry-After: 1`.
+
 ## Building large extracts and the planet
 
 The builder streams: OSM objects, node references, coordinates, and finished records flow through external sorts, so its large buffers stay within `--memory-budget-mb` whatever the input size.
@@ -84,10 +88,13 @@ cargo run --release -- build --input new-zealand.osm.pbf --addresses linz=oa_nz.
 ```
 
 - Rows are streamed in batches and go through the same sorters, boundary context, postcode centroids, text index and reverse geocoding as OSM addresses, so the memory budget holds whatever the file size.
+- Imported rows matching an OSM address with the same street and number within 150 m are skipped; imported rows are not deduplicated against each other.
+- The build report records input rows in `scanned.address_rows` and OSM matches skipped in `scanned.duplicate_address_rows`.
 - A record's id is `dataset:row` (`linz:42`): the dataset name, or the file stem without one, and the row's 1-based position among the data rows. Its source reports object type `row`.
 - Rows without a number or street, or with coordinates that are missing, not numeric or out of range, are skipped and counted in the build report (`scanned.address_rows`, `rejected.by_reason`). A record with a line break inside a field, as a stray quote makes it, is rejected as `malformed_row`, and the rows it swallows are lost with it; files should be well-formed CSV.
-- Rows are not deduplicated against OSM addresses or each other.
 - Packs without imported rows are unchanged and older Packs still open. A Pack with imported rows stores its record sections as version 5, so an older binary refuses it when it opens it.
+
+Official address sources have their own attribution terms: Luxembourg BD-Adresses is CC0. For swisstopo data, use the attribution `Source: Federal Office of Topography swisstopo` and see <https://www.swisstopo.admin.ch/ogd-conditions>.
 
 ## Rebuilding packs safely
 
@@ -113,6 +120,7 @@ Keys use the same normalization as the text index, so a query's street hashes li
 It costs about 1.2 bytes per key and has about 0.4% false positives and no false negatives.
 A Pack with no street at all gets an empty filter, which says it holds nothing; a Pack without the section was built before it existed, and the router treats it as holding anything.
 The header carries a key scheme number, bumped whenever the normalization, the abbreviation rules or the hashes change, and a reader refuses a filter of another scheme, so a router built with other rules treats that Runtime as holding anything instead of misrouting.
+Scheme 2 is the one with accent folding and the French and German abbreviations: a router of this build ignores the filter an older Runtime serves from a scheme 1 Pack (that Runtime counts as holding anything) until the Runtime is upgraded and its Pack rebuilt.
 It is a section of its own version: Packs without it still open, and older binaries ignore it (the container lists unknown sections and checksums them like the others).
 
 **`GET /routing-filter`.**
@@ -125,16 +133,20 @@ The endpoint is for the router, on the internal network: the body is megabytes (
 **Router behaviour.**
 For `/geocode` the street is `address` without its house number and unit and the town is `locality`; for `/search` and `/autocomplete` the street comes from `q` and `locality` is an optional hint that the Runtimes ignore.
 Text before the number is read two ways (a unit like "Level 3", or part of a name like "Highway 6 North") and both are tried.
+Only a leading house number is read: an address written with the number after the street ("Rue de la Paix 12") or with a bis/ter suffix ("12 ter Rue de la Paix") finds no holder and goes to the fan-out.
 
 1. If exactly one country's filter holds the street with the town, the request goes there.
 2. Else if exactly one holds the street, it goes there. This step is for `/geocode`, and for `/search` with a house number or a `locality`: a name with no number may be a place, and `/autocomplete` text may be half a street, so `/autocomplete` routes only with a `locality`.
-3. Else every Runtime is asked, and `/search` and `/autocomplete` merge by score.
+3. Else every Runtime is asked, and `/search` and `/autocomplete` merge: labels that cover more of the query first (for autocomplete the last word counts as a prefix), then each Runtime's own ranking, interleaved, since BM25 scores of different Packs do not compare.
    `/geocode` answers the one non-null result; when several Runtimes answer, the score of one Pack against another's is not evidence (a street held by several countries makes each of them answer, and an address alone gives them no locality, region or postcode to check), so unless exactly one answering Runtime has a filter that holds the street, the router answers 400 `country_required`.
 
 A Runtime without a readable filter counts as holding anything, so it never lets another win alone, but it never wins alone either: a request is routed only when a filter confirms the country.
 A routed Runtime that fails, or answers with nothing, is followed by the fan-out, because a filter can be wrong (a false positive, a town spelled another way).
+A Runtime that sheds load (a 503 with `Retry-After`) is the exception: its answer goes back as it is, with the header, and nobody is asked again; when every Runtime sheds in a fan-out, the first one's 503 goes back.
+The route taken and the country are logged at debug level as `routed`.
 The street comes from the whole text, so a one-string address that includes the town or postcode ("15 Eruera Street, Rotorua 3010") finds no holder and is asked of everyone; send the town as `locality` to route it.
 Responses carry `x-route` (`filter-street-town`, `filter-street`, `fanout`, or `country` when `country=XX` was given) and, when one Runtime answered, `x-route-country`; routed and merged results carry a `country`.
+The router's request id goes to every Runtime it calls as `x-request-id`, so one request has one id in both logs.
 
 The router fetches every filter at startup, then every `--filter-refresh-secs` (default 300, `0` turns the timer off), and again as soon as `/readyz` sees a Runtime that was not ready turn ready, so a swapped Pack is picked up without restarting the router.
 The first fetch runs in the background, so the router listens at once, and a Runtime that has no filter yet (still starting, or an old Pack) is asked again every 15 seconds.

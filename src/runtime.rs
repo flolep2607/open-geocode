@@ -1,10 +1,12 @@
 use std::{
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -19,7 +21,11 @@ use axum::{
     routing::{MethodFilter, MethodRouter, on},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, task};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task,
+};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
@@ -28,6 +34,7 @@ use crate::{
         bounds, health, method,
         problem::{Problem, classify_search_error},
         request_id::{self, RequestId},
+        shutdown::shutdown_signal,
     },
     pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
     record::OsmObjectType,
@@ -45,6 +52,16 @@ pub struct ServeOptions {
     pub demo: PathBuf,
     pub bind: SocketAddr,
     pub basemap: PathBuf,
+    /// API requests allowed on the blocking pool at once; at least 1.
+    pub max_concurrency: usize,
+}
+
+/// How long an API request waits for a blocking-pool slot before it is shed with 503.
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The default for `serve --max-concurrency`: one request per core.
+pub fn default_max_concurrency() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 #[derive(Clone)]
@@ -54,6 +71,10 @@ pub(crate) struct AppState {
     /// The Pack's routing filter, when it has one, for `/routing-filter`.
     routing_filter: Option<Arc<RoutingFilterSection>>,
     ready: Arc<AtomicBool>,
+    /// Bounds the API work on `spawn_blocking`, whose pool would otherwise grow to 512 threads
+    /// under a burst and queue requests without limit.
+    permits: Arc<Semaphore>,
+    queue_timeout: Duration,
 }
 
 /// The `routing/filter` section as the Pack holds it. `bytes` is a slice of the mapped file, so
@@ -81,7 +102,7 @@ impl AppState {
                 })
             }),
             Err(error) => {
-                eprintln!("not serving a routing filter: {error:#}");
+                tracing::warn!("not serving a routing filter: {error:#}");
                 None
             }
         };
@@ -92,7 +113,14 @@ impl AppState {
             reverse_geocoder: Arc::new(reverse_geocoder),
             routing_filter,
             ready: Arc::new(AtomicBool::new(true)),
+            permits: Arc::new(Semaphore::new(default_max_concurrency().get())),
+            queue_timeout: QUEUE_TIMEOUT,
         })
+    }
+
+    fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.permits = Arc::new(Semaphore::new(max_concurrency.max(1)));
+        self
     }
 
     /// True once the Pack is loaded and the Runtime can answer API traffic
@@ -191,20 +219,32 @@ pub struct SearchApiSource {
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let state = AppState::open(&options.pack)
-        .with_context(|| format!("failed to open Pack {}", options.pack.display()))?;
+        .with_context(|| format!("failed to open Pack {}", options.pack.display()))?
+        .with_max_concurrency(options.max_concurrency);
+    let ready = Arc::clone(&state.ready);
     let app = build_router(state, &options.demo, &options.basemap);
 
     let listener = TcpListener::bind(options.bind)
         .await
         .with_context(|| format!("failed to bind {}", options.bind))?;
-    println!(
-        "Serving {} at http://{}",
-        options.pack.display(),
+    tracing::info!(
+        pack = %options.pack.display(),
+        max_concurrency = options.max_concurrency.max(1),
+        "serving at http://{}",
         options.bind
     );
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Not ready from here on, so a probe that still reaches us takes us out of rotation
+            // while in-flight requests finish.
+            ready.store(false, Ordering::Release);
+            tracing::info!("shutdown signal received, draining in-flight requests");
+        })
         .await
-        .context("runtime server failed")
+        .context("runtime server failed")?;
+    tracing::info!("runtime stopped");
+    Ok(())
 }
 
 /// Assemble the public-demo router with its boundary policy: method-restricted
@@ -240,11 +280,11 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // native range support and no policy.
     if basemap.exists() {
         app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
-        println!("Serving basemap {}", basemap.display());
+        tracing::info!(basemap = %basemap.display(), "serving basemap");
     } else {
-        eprintln!(
-            "basemap {} not found; serving demo without a basemap",
-            basemap.display()
+        tracing::warn!(
+            basemap = %basemap.display(),
+            "basemap not found; serving demo without a basemap"
         );
     }
 
@@ -252,9 +292,11 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
     // is replaced with a Problem Details 404 so unknown paths don't fall through
     // to a static-file response (Decision 37). `method_not_allowed_fallback`
     // turns method mismatches into a Problem 405 instead of an empty body. The
-    // request-id layer is outermost so it also wraps both fallbacks.
+    // request-id layer is outermost so it also wraps both fallbacks, and the
+    // trace layer inside it can read the id.
     app.method_not_allowed_fallback(method::method_not_allowed)
         .fallback_service(ServeDir::new(demo).not_found_service(method::not_found.into_service()))
+        .layer(request_id::trace_layer())
         .layer(middleware::from_fn(request_id::propagate))
         .with_state(state)
 }
@@ -280,11 +322,30 @@ fn with_id(problem: Problem, request_id: &Option<String>) -> Problem {
 /// A bare 500 for the client, with the cause logged here under the request id: the body must not
 /// carry it (ADR 0017 Decision 31), so the log is the only place it survives.
 fn internal(cause: impl std::fmt::Display, request_id: &Option<String>) -> Problem {
-    eprintln!(
-        "internal error (request {}): {cause:#}",
-        request_id.as_deref().unwrap_or("-")
+    tracing::error!(
+        request_id = request_id.as_deref().unwrap_or("-"),
+        "internal error: {cause:#}"
     );
     with_id(Problem::internal(), request_id)
+}
+
+/// A slot on the blocking pool, or 503 when none frees up within the queue timeout. The permit
+/// is moved into the blocking closure, so the slot frees only when that work really ends, even if
+/// the client has gone.
+async fn acquire_permit(
+    state: &AppState,
+    request_id: &Option<String>,
+) -> Result<OwnedSemaphorePermit, Problem> {
+    match tokio::time::timeout(
+        state.queue_timeout,
+        Arc::clone(&state.permits).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(closed)) => Err(internal(closed, request_id)),
+        Err(_) => Err(with_id(Problem::overloaded(), request_id)),
+    }
 }
 
 /// A search error as a Problem, logging the cause when it is ours rather than the query's.
@@ -319,11 +380,15 @@ async fn search(
         limit: params.limit,
         layer: params.layer,
     };
+    let permit = acquire_permit(&state, &request_id).await?;
     let searcher = Arc::clone(&state.searcher);
-    let hits = task::spawn_blocking(move || searcher.search(options))
-        .await
-        .map_err(|error| internal(error, &request_id))?
-        .map_err(|error| search_error(error, &request_id))?;
+    let hits = task::spawn_blocking(move || {
+        let _permit = permit;
+        searcher.search(options)
+    })
+    .await
+    .map_err(|error| internal(error, &request_id))?
+    .map_err(|error| search_error(error, &request_id))?;
 
     Ok(Json(SearchResponse {
         query,
@@ -375,11 +440,15 @@ async fn geocode(
         layer: params.layer,
         street_fallback: params.street_fallback,
     };
+    let permit = acquire_permit(&state, &request_id).await?;
     let searcher = Arc::clone(&state.searcher);
-    let hit = task::spawn_blocking(move || searcher.geocode_address(options))
-        .await
-        .map_err(|_| with_id(Problem::internal(), &request_id))?
-        .map_err(|error| with_id(classify_search_error(error), &request_id))?;
+    let hit = task::spawn_blocking(move || {
+        let _permit = permit;
+        searcher.geocode_address(options)
+    })
+    .await
+    .map_err(|error| internal(error, &request_id))?
+    .map_err(|error| search_error(error, &request_id))?;
 
     Ok(Json(match hit {
         Some(hit) => GeocodeResponse {
@@ -418,11 +487,15 @@ async fn autocomplete(
         limit: params.limit,
         layer: params.layer,
     };
+    let permit = acquire_permit(&state, &request_id).await?;
     let searcher = Arc::clone(&state.searcher);
-    let hits = task::spawn_blocking(move || searcher.autocomplete(options))
-        .await
-        .map_err(|error| internal(error, &request_id))?
-        .map_err(|error| search_error(error, &request_id))?;
+    let hits = task::spawn_blocking(move || {
+        let _permit = permit;
+        searcher.autocomplete(options)
+    })
+    .await
+    .map_err(|error| internal(error, &request_id))?
+    .map_err(|error| search_error(error, &request_id))?;
 
     Ok(Json(AutocompleteResponse {
         query,
@@ -446,8 +519,10 @@ async fn reverse(
     bounds::validate_coords(params.lon, params.lat)
         .map_err(|problem| with_id(problem, &request_id))?;
 
+    let permit = acquire_permit(&state, &request_id).await?;
     let geocoder = Arc::clone(&state.reverse_geocoder);
     let response = task::spawn_blocking(move || {
+        let _permit = permit;
         geocoder.reverse(ReverseGeocodeOptions {
             lon: params.lon,
             lat: params.lat,
@@ -967,6 +1042,46 @@ mod router_tests {
         );
         let reply = send(router, request("POST", "/routing-filter")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn api_sheds_load_with_retry_after_when_no_slot_frees_up() {
+        let pack = temp_path("overloaded");
+        write_pack(&pack);
+        let demo = temp_path("overloaded-demo");
+        let no_basemap = temp_path("overloaded-no-basemap");
+        let mut state = state_for(&pack, true);
+        state.permits = Arc::new(Semaphore::new(0));
+        state.queue_timeout = Duration::from_millis(10);
+        let router = build_router(state, &demo, &no_basemap);
+
+        for uri in [
+            "/search?q=king",
+            "/autocomplete?q=kin",
+            "/geocode?address=10%20King%20Street",
+            "/reverse?lon=-79.0&lat=43.0",
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(reply.content_type(), "application/problem+json");
+            assert_eq!(
+                reply
+                    .headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("1")
+            );
+            assert_eq!(reply.json()["error_code"], "overloaded");
+            assert!(reply.json()["request_id"].is_string());
+        }
+
+        // Health probes never wait for a slot.
+        let reply = send(router.clone(), request("GET", "/healthz")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let reply = send(router, request("GET", "/readyz")).await;
+        assert_eq!(reply.status, StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&pack);
     }

@@ -167,7 +167,7 @@ pub(crate) fn import_addresses(
         } else {
             emit_row(&file.dataset, row, &columns, &record, &mut out);
         }
-        if row as u64 % BATCH_ROWS == 0 {
+        if (row as u64).is_multiple_of(BATCH_ROWS) {
             sink(mem::take(&mut out))?;
         }
     }

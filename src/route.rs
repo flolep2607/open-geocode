@@ -21,8 +21,10 @@
 //!   filters can be wrong, so it goes on to every Runtime.
 //! - When the filters cannot decide (zero or several Runtimes hold the street, or a request with
 //!   no street) the request goes to every Runtime at once, as before (`x-route: fanout`).
-//!   `/search` and `/autocomplete` results are merged by score and cut to `limit`, each carrying
-//!   the `country` it came from. `/geocode` answers one best match or `null`. A single non-null
+//!   `/search` and `/autocomplete` results are merged and cut to `limit`, each carrying the
+//!   `country` it came from. BM25 scores from different Packs are not comparable, so the merge
+//!   ranks first by how much of the query a label covers, then by rank within its own Runtime's
+//!   list (see [`merge`]). `/geocode` answers one best match or `null`. A single non-null
 //!   answer wins. Several do not pick a winner by score, which is not comparable across Packs,
 //!   and a request with only an address gives the Runtimes no locality, region or postcode to
 //!   check, so each answers for any street it has: unless exactly one of the answering Runtimes
@@ -32,7 +34,8 @@
 //! - `/readyz` is ready only when every Runtime is.
 //!
 //! The router holds no Pack and does no geocoding. It keeps the Runtime's boundary policy: GET
-//! only, Problem Details for errors, request-id propagation.
+//! only, Problem Details for errors, request-id propagation. Its request id is sent to every
+//! Runtime it calls as `x-request-id`, so router and Runtime logs share one id per request.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -70,9 +73,11 @@ use crate::{
         method,
         problem::Problem,
         request_id::{self, RequestId},
+        shutdown::shutdown_signal,
     },
     search::DEFAULT_SEARCH_LIMIT,
     street_filter::{RoutingFilter, pair_hash, query_street_hashes, town_hash},
+    text_index::normalize_index_text,
 };
 
 /// How long the router waits for one Runtime before answering 502 (or leaving it out of a merge).
@@ -195,40 +200,63 @@ impl RouteState {
         self.workers.keys().cloned().collect::<Vec<_>>().join(", ")
     }
 
-    /// GET `url`, or None when the Runtime did not answer in time.
+    /// GET `url` under `request_id`, or None when the Runtime did not answer in time. The answer
+    /// keeps all its headers; [`pass_through`] chooses the ones worth handing on.
     async fn fetch(
         &self,
         url: &str,
         if_none_match: Option<&str>,
         timeout: Duration,
+        request_id: Option<&str>,
     ) -> Option<Upstream> {
+        let answer = self
+            .try_fetch(url, if_none_match, timeout, request_id)
+            .await;
+        if let Err(error) = &answer {
+            // The query string is the searched address; keep it out of the logs.
+            let url = url.split_once('?').map_or(url, |(path, _)| path);
+            tracing::warn!(
+                request_id = request_id.unwrap_or("-"),
+                url,
+                "Runtime did not answer: {error:#}"
+            );
+        }
+        answer.ok()
+    }
+
+    async fn try_fetch(
+        &self,
+        url: &str,
+        if_none_match: Option<&str>,
+        timeout: Duration,
+        request_id: Option<&str>,
+    ) -> Result<Upstream> {
         let mut request = Request::get(url);
         if let Some(etag) = if_none_match {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
-        let request = request.body(Empty::new()).ok()?;
+        if let Some(id) = request_id {
+            request = request.header("x-request-id", id);
+        }
+        let request = request.body(Empty::new())?;
         let response = tokio::time::timeout(timeout, self.client.request(request))
             .await
-            .ok()?
-            .ok()?;
+            .context("timed out")??;
         let (parts, body) = response.into_parts();
         let body = tokio::time::timeout(timeout, body.collect())
             .await
-            .ok()?
-            .ok()?
+            .context("timed out reading the body")??
             .to_bytes();
-        Some(Upstream {
+        Ok(Upstream {
             status: parts.status,
             headers: parts.headers,
             body,
         })
     }
 
-    /// GET `url`: (status, content type, body), or None when the Runtime did not answer in time.
-    async fn get(&self, url: &str) -> Option<(StatusCode, Option<HeaderValue>, Bytes)> {
-        let upstream = self.fetch(url, None, UPSTREAM_TIMEOUT).await?;
-        let content_type = upstream.headers.get(header::CONTENT_TYPE).cloned();
-        Some((upstream.status, content_type, upstream.body))
+    /// GET `url` under `request_id` with the answer timeout.
+    async fn get(&self, url: &str, request_id: Option<&str>) -> Option<Upstream> {
+        self.fetch(url, None, UPSTREAM_TIMEOUT, request_id).await
     }
 
     /// Fetch one Runtime's routing filter again. A held filter is kept when the Runtime does not
@@ -242,9 +270,18 @@ impl RouteState {
         let _refreshing = worker.refreshing.lock().await;
         let etag = worker.slot.read().expect("filter slot").etag.clone();
         let url = format!("{}/routing-filter", worker.base);
-        let answer = self.fetch(&url, etag.as_deref(), FILTER_TIMEOUT).await;
-        let Some(answer) = answer.filter(|answer| !answer.status.is_server_error()) else {
-            return;
+        // Not fetch(): a Runtime that is down is retried every FILTER_RETRY, which must not warn
+        // each time. Searches that reach it say so.
+        let answer = match self
+            .try_fetch(&url, etag.as_deref(), FILTER_TIMEOUT, None)
+            .await
+        {
+            Ok(answer) if !answer.status.is_server_error() => answer,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::debug!("{country}: routing filter not fetched: {error:#}");
+                return;
+            }
         };
         let slot = match answer.status {
             StatusCode::NOT_MODIFIED => return,
@@ -258,7 +295,7 @@ impl RouteState {
                     .map(Arc::new)
                     .inspect_err(|error| {
                         // Once per body: the same bytes come back as a 304.
-                        eprintln!("{country}: ignoring its routing filter: {error:#}");
+                        tracing::warn!("{country}: ignoring its routing filter: {error:#}");
                     })
                     .ok();
                 Slot { etag, filter }
@@ -350,14 +387,14 @@ impl RouteState {
 
 /// Parse `country=` and `limit=` out of a raw query string; the query itself is forwarded as is.
 fn query_params(raw: Option<&str>) -> (Option<String>, usize) {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(raw.unwrap_or_default()).unwrap_or_default();
     let mut country = None;
     let mut limit = DEFAULT_SEARCH_LIMIT;
-    for pair in raw.unwrap_or_default().split('&') {
-        match pair.split_once('=') {
-            Some(("country", value)) if !value.is_empty() => {
-                country = Some(value.to_ascii_uppercase())
-            }
-            Some(("limit", value)) => limit = value.parse().unwrap_or(DEFAULT_SEARCH_LIMIT),
+    for (name, value) in pairs {
+        match name.as_str() {
+            "country" if !value.is_empty() => country = Some(value.to_ascii_uppercase()),
+            "limit" => limit = value.parse().unwrap_or(DEFAULT_SEARCH_LIMIT),
             _ => {}
         }
     }
@@ -416,8 +453,12 @@ impl RouteKeys {
 /// How an endpoint answers: a list of results, or one best match.
 #[derive(Clone, Copy)]
 enum Shape {
-    /// `/search`, `/autocomplete`: the array under this key.
-    List(&'static str),
+    /// `/search`, `/autocomplete`: the array under this key. `prefix_last` is passed to
+    /// [`merge`]: autocomplete's last query token may be a partial word.
+    List {
+        key: &'static str,
+        prefix_last: bool,
+    },
     /// `/geocode`: `result`, an object or null.
     Best,
 }
@@ -425,7 +466,7 @@ enum Shape {
 impl Shape {
     fn key(self) -> &'static str {
         match self {
-            Self::List(key) => key,
+            Self::List { key, .. } => key,
             Self::Best => "result",
         }
     }
@@ -445,30 +486,106 @@ fn tag_country(body: &mut Value, key: &str, country: &str) {
     }
 }
 
-/// Merge each Runtime's `key` array into one, best score first, cut to `limit`, each tagged with
-/// its country. `answers` are (country, parsed response body) pairs.
-fn merge(answers: Vec<(String, Value)>, key: &str, limit: usize) -> Value {
+/// The distinct normalised tokens of `text`, in order of first appearance.
+fn tokens(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for token in normalize_index_text(text)
+        .unwrap_or_default()
+        .split_whitespace()
+    {
+        if !tokens.iter().any(|seen| seen == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
+}
+
+/// The fraction of the distinct `query_tokens` found among the tokens of `label`. With
+/// `prefix_last`, the query's last token (`last`) also matches as a prefix, since the user is
+/// still typing it.
+fn coverage(query_tokens: &[String], last: Option<&str>, label: &str, prefix_last: bool) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let label = tokens(label);
+    let matched = query_tokens
+        .iter()
+        .filter(|token| {
+            label.contains(token)
+                || (prefix_last
+                    && last == Some(token.as_str())
+                    && label.iter().any(|word| word.starts_with(token.as_str())))
+        })
+        .count();
+    matched as f64 / query_tokens.len() as f64
+}
+
+/// Merge each Runtime's `key` array into one, cut to `limit`, each tagged with its country.
+/// `answers` are (country, parsed response body) pairs.
+///
+/// Raw scores are BM25 over each Pack's own corpus, so they do not compare across countries.
+/// Results are ranked by the share of the query their label covers, then by rank in their own
+/// Runtime's list (so equal matches interleave across countries), then by score, then by country.
+/// `prefix_last` is for autocomplete, where the last query token may be a partial word.
+fn merge(answers: Vec<(String, Value)>, key: &str, limit: usize, prefix_last: bool) -> Value {
     let query = answers
         .iter()
         .find_map(|(_, body)| body.get("query").cloned())
         .unwrap_or(Value::Null);
-    let mut merged: Vec<Value> = answers
+    let query_text = query.as_str().unwrap_or_default();
+    let query_tokens = tokens(query_text);
+    let last = normalize_index_text(query_text)
+        .and_then(|text| text.split_whitespace().last().map(str::to_string));
+
+    struct Ranked {
+        coverage: f64,
+        rank: usize,
+        score: f64,
+        country: String,
+        item: Value,
+    }
+    let mut merged: Vec<Ranked> = answers
         .into_iter()
         .flat_map(|(country, mut body)| {
             tag_country(&mut body, key, &country);
-            match body.get_mut(key).map(Value::take) {
+            let items = match body.get_mut(key).map(Value::take) {
                 Some(Value::Array(items)) => items,
                 _ => Vec::new(),
-            }
+            };
+            let query_tokens = &query_tokens;
+            let last = last.as_deref();
+            items.into_iter().enumerate().map(move |(rank, item)| {
+                let label = item
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let coverage = coverage(query_tokens, last, label, prefix_last);
+                let score = item
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(f64::MIN);
+                Ranked {
+                    coverage,
+                    rank,
+                    score,
+                    country: country.clone(),
+                    item,
+                }
+            })
         })
         .collect();
-    let score = |item: &Value| {
-        item.get("score")
-            .and_then(Value::as_f64)
-            .unwrap_or(f64::MIN)
-    };
-    merged.sort_by(|a, b| score(b).total_cmp(&score(a)));
-    merged.truncate(limit);
+    merged.sort_by(|a, b| {
+        b.coverage
+            .total_cmp(&a.coverage)
+            .then(a.rank.cmp(&b.rank))
+            .then(b.score.total_cmp(&a.score))
+            .then_with(|| a.country.cmp(&b.country))
+    });
+    let merged: Vec<Value> = merged
+        .into_iter()
+        .take(limit)
+        .map(|ranked| ranked.item)
+        .collect();
     json!({ "query": query, key: merged })
 }
 
@@ -538,19 +655,34 @@ fn with_id(problem: Problem, request_id: &Option<Extension<RequestId>>) -> Respo
     }
 }
 
-/// A Runtime's answer handed back as it came.
-fn passthrough(status: StatusCode, content_type: Option<HeaderValue>, body: Bytes) -> Response {
-    let mut response = (status, Body::from(body)).into_response();
-    if let Some(content_type) = content_type {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
+/// A Runtime's answer handed back as it came. Of its headers only the content type and
+/// `Retry-After` go on, which keeps a Runtime's load-shedding 503 actionable through the router.
+fn pass_through(upstream: Upstream) -> Response {
+    let mut response = (upstream.status, Body::from(upstream.body)).into_response();
+    for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
+        if let Some(value) = upstream.headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
     }
     response
 }
 
+/// A Runtime that asks to be retried later is shedding load; asking it again or its neighbours
+/// would only add to it.
+fn is_shed(upstream: &Upstream) -> bool {
+    upstream.headers.contains_key(header::RETRY_AFTER)
+}
+
+/// The id of the router's own request, to send on to the Runtimes it calls.
+fn id_of(request_id: &Option<Extension<RequestId>>) -> Option<&str> {
+    request_id
+        .as_ref()
+        .map(|Extension(RequestId(id))| id.as_str())
+}
+
 /// Say how the request was routed: `x-route`, and `x-route-country` when one country answered.
 fn tagged(mut response: Response, route: &'static str, country: Option<&str>) -> Response {
+    tracing::debug!(route, country = country.unwrap_or("-"), "routed");
     response
         .headers_mut()
         .insert(ROUTE_HEADER, HeaderValue::from_static(route));
@@ -576,42 +708,47 @@ async fn forward_to_country(
             request_id,
         );
     };
-    match state.get(&format!("{}{path}{suffix}", worker.base)).await {
-        Some((status, content_type, body)) => tagged(
-            passthrough(status, content_type, body),
-            "country",
-            Some(country),
-        ),
+    let url = format!("{}{path}{suffix}", worker.base);
+    match state.get(&url, id_of(request_id)).await {
+        Some(answer) => tagged(pass_through(answer), "country", Some(country)),
         None => with_id(Problem::upstream_unavailable(country), request_id),
     }
 }
 
 /// Ask every Runtime at once. A Runtime's 4xx (a bad query) is every Runtime's, so the first one
-/// is handed back as the `Err`; one that failed or did not answer is left out.
+/// is handed back as the `Err`; one that failed or did not answer is left out. When nothing
+/// answered and one Runtime asked to be retried later, its answer is the `Err`, `Retry-After`
+/// kept.
 async fn fan_out(
     state: &RouteState,
     path: &str,
     suffix: &str,
+    id: Option<&str>,
 ) -> Result<Vec<(String, Value)>, Box<Response>> {
     let calls = state.workers.iter().map(|(country, worker)| {
         let url = format!("{}{path}{suffix}", worker.base);
-        async move { (country.clone(), state.get(&url).await) }
+        async move { (country.clone(), state.get(&url, id).await) }
     });
     let mut answers = Vec::new();
+    let mut shed = None;
     for (country, answer) in join_all(calls).await {
         match answer {
-            Some((status, content_type, body)) if status.is_client_error() => {
-                return Err(Box::new(passthrough(status, content_type, body)));
+            Some(answer) if answer.status.is_client_error() => {
+                return Err(Box::new(pass_through(answer)));
             }
-            Some((status, _, body)) if status.is_success() => {
-                if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+            Some(answer) if answer.status.is_success() => {
+                if let Ok(value) = serde_json::from_slice::<Value>(&answer.body) {
                     answers.push((country, value));
                 }
             }
+            Some(answer) if is_shed(&answer) && shed.is_none() => shed = Some(answer),
             _ => {}
         }
     }
-    Ok(answers)
+    match shed {
+        Some(answer) if answers.is_empty() => Err(Box::new(pass_through(answer))),
+        _ => Ok(answers),
+    }
 }
 
 /// Answer `path?raw` from the one Runtime the request names (`country=XX`) or the filters pick,
@@ -639,16 +776,12 @@ async fn forward_or_merge(
     };
     if let Some((country, route)) = routed {
         let url = format!("{}{path}{suffix}", state.workers[country].base);
-        match state.get(&url).await {
-            Some((status, content_type, body)) if status.is_client_error() => {
-                return tagged(
-                    passthrough(status, content_type, body),
-                    route,
-                    Some(country),
-                );
+        match state.get(&url, id_of(&request_id)).await {
+            Some(answer) if answer.status.is_client_error() => {
+                return tagged(pass_through(answer), route, Some(country));
             }
-            Some((status, content_type, body)) if status.is_success() => {
-                match serde_json::from_slice::<Value>(&body) {
+            Some(answer) if answer.status.is_success() => {
+                match serde_json::from_slice::<Value>(&answer.body) {
                     // A filter can be wrong (a false positive, a town spelled another way), and
                     // an empty answer from the wrong country must not end the search.
                     Ok(value) if !has_answer(&value, shape) => {}
@@ -656,29 +789,27 @@ async fn forward_or_merge(
                         tag_country(&mut value, shape.key(), country);
                         return tagged(axum::Json(value).into_response(), route, Some(country));
                     }
-                    Err(_) => {
-                        return tagged(
-                            passthrough(status, content_type, body),
-                            route,
-                            Some(country),
-                        );
-                    }
+                    Err(_) => return tagged(pass_through(answer), route, Some(country)),
                 }
+            }
+            Some(answer) if is_shed(&answer) => {
+                return tagged(pass_through(answer), route, Some(country));
             }
             // The chosen Runtime failed, did not answer or found nothing: the others may still
             // know the street.
             _ => {}
         }
+        tracing::debug!(route, country = %country, "routed Runtime had no answer, asking every Runtime");
     }
 
-    let answers = match fan_out(state, path, &suffix).await {
+    let answers = match fan_out(state, path, &suffix, id_of(&request_id)).await {
         Ok(answers) if !answers.is_empty() => answers,
         Ok(_) => return with_id(Problem::upstream_unavailable("any"), &request_id),
         Err(response) => return *response,
     };
     match shape {
-        Shape::List(key) => tagged(
-            axum::Json(merge(answers, key, limit)).into_response(),
+        Shape::List { key, prefix_last } => tagged(
+            axum::Json(merge(answers, key, limit, prefix_last)).into_response(),
             "fanout",
             None,
         ),
@@ -709,7 +840,10 @@ async fn search(
     forward_or_merge(
         &state,
         "/search",
-        Shape::List("results"),
+        Shape::List {
+            key: "results",
+            prefix_last: false,
+        },
         raw,
         keys,
         request_id,
@@ -727,7 +861,10 @@ async fn autocomplete(
     forward_or_merge(
         &state,
         "/autocomplete",
-        Shape::List("suggestions"),
+        Shape::List {
+            key: "suggestions",
+            prefix_last: true,
+        },
         raw,
         keys,
         request_id,
@@ -766,12 +903,17 @@ async fn healthz() -> StatusCode {
 }
 
 /// Ready only when every Runtime answers its own `/readyz` with 200.
-async fn readyz(State(state): State<RouteState>) -> StatusCode {
+async fn readyz(
+    State(state): State<RouteState>,
+    request_id: Option<Extension<RequestId>>,
+) -> StatusCode {
+    let id = id_of(&request_id);
     let calls = state.workers.iter().map(|(country, worker)| {
         let url = format!("{}/readyz", worker.base);
         let state = &state;
         async move {
-            let ready = state.get(&url).await.map(|(status, _, _)| status) == Some(StatusCode::OK);
+            let ready =
+                state.get(&url, id).await.map(|answer| answer.status) == Some(StatusCode::OK);
             state.note_ready(country, ready);
             ready
         }
@@ -802,13 +944,18 @@ fn build_router(state: RouteState) -> Router {
         .route("/readyz", get_only(readyz))
         .method_not_allowed_fallback(method::method_not_allowed)
         .fallback_service(method::not_found.into_service())
+        .layer(request_id::trace_layer())
         .layer(middleware::from_fn(request_id::propagate))
         .with_state(state)
 }
 
 pub async fn route(options: RouteOptions) -> Result<()> {
     let state = RouteState::new(options.workers)?;
-    println!("Routing {} at http://{}", state.known(), options.bind);
+    tracing::info!(
+        workers = %state.known(),
+        "routing at http://{}",
+        options.bind
+    );
     let listener = TcpListener::bind(options.bind)
         .await
         .with_context(|| format!("failed to bind {}", options.bind))?;
@@ -818,7 +965,7 @@ pub async fn route(options: RouteOptions) -> Result<()> {
     let background = state.clone();
     tokio::spawn(async move {
         background.refresh_filters().await;
-        println!("{}", background.filter_summary());
+        tracing::info!("{}", background.filter_summary());
         // Zero turns the timer off.
         while !refresh.is_zero() {
             // A Runtime without a filter is asked again soon: it may only have been starting.
@@ -832,8 +979,14 @@ pub async fn route(options: RouteOptions) -> Result<()> {
         }
     });
     axum::serve(listener, build_router(state))
+        .with_graceful_shutdown(async {
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received, draining in-flight requests");
+        })
         .await
-        .context("router failed")
+        .context("router failed")?;
+    tracing::info!("router stopped");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -861,6 +1014,8 @@ mod tests {
         not_modified: Arc<AtomicUsize>,
         /// Status /search, /autocomplete and /geocode answer instead of their result; 0 for none.
         fail_with: Arc<AtomicU16>,
+        /// Send `Retry-After` with a `fail_with` status, like a Runtime shedding load.
+        retry_after: Arc<AtomicBool>,
         /// Make /routing-filter answer 500.
         filter_broken: Arc<AtomicBool>,
         /// Milliseconds /routing-filter waits after it has read its bytes, before it answers.
@@ -887,20 +1042,31 @@ mod tests {
             sent: Arc::default(),
             not_modified: Arc::default(),
             fail_with: Arc::default(),
+            retry_after: Arc::default(),
             filter_broken: Arc::default(),
             filter_delay: Arc::default(),
         };
         let answer = |fake: &Fake, body: Value| {
             let (hits, fail_with) = (fake.hits.clone(), fake.fail_with.clone());
+            let retry_after = fake.retry_after.clone();
             move || {
                 let (hits, fail_with, body) = (hits.clone(), fail_with.clone(), body.clone());
+                let retry_after = retry_after.clone();
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
                     match fail_with.load(Ordering::SeqCst) {
                         0 => axum::Json(body).into_response(),
-                        status => StatusCode::from_u16(status)
-                            .expect("status")
-                            .into_response(),
+                        status => {
+                            let mut response = StatusCode::from_u16(status)
+                                .expect("status")
+                                .into_response();
+                            if retry_after.load(Ordering::SeqCst) {
+                                response
+                                    .headers_mut()
+                                    .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                            }
+                            response
+                        }
                     }
                 }
             }
@@ -1107,7 +1273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn country_goes_to_its_runtime_and_none_merges_by_score() {
+    async fn country_goes_to_its_runtime_and_none_merges() {
         let au = fake_runtime(
             json!([{ "label": "au-a", "score": 5.0 }, { "label": "au-b", "score": 1.0 }]),
             StatusCode::OK,
@@ -1175,6 +1341,55 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn request_id_reaches_every_upstream_call() {
+        // Echoes the x-request-id it was sent, in the body and on /readyz as a status.
+        let echo = |headers: HeaderMap| async move {
+            let id = headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(json!({ "query": "q", "results": [{ "label": id, "score": 1.0 }] }))
+        };
+        let app = Router::new()
+            .route("/search", axum::routing::get(echo))
+            .route(
+                "/readyz",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    if headers.get("x-request-id").is_some_and(|v| v == "ray-42") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::IM_A_TEAPOT
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let upstream = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let base = router(vec![("AU", upstream)]).await;
+
+        let client: Client<HttpConnector, Empty<Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let call = |path: &str| {
+            let request = hyper::Request::get(format!("{base}{path}"))
+                .header("cf-ray", "ray-42")
+                .body(Empty::new())
+                .expect("request");
+            client.request(request)
+        };
+
+        for path in ["/search?q=x&country=au", "/search?q=x"] {
+            let response = call(path).await.expect("response");
+            assert_eq!(response.headers()["x-request-id"], "ray-42");
+            let body = response.into_body().collect().await.expect("body");
+            let body: Value = serde_json::from_slice(&body.to_bytes()).expect("json");
+            assert_eq!(body["results"][0]["label"], "ray-42", "{path}");
+        }
+        let response = call("/readyz").await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[test]
     fn query_params_read_country_and_limit() {
         assert_eq!(
@@ -1182,6 +1397,16 @@ mod tests {
             (Some("NZ".to_string()), 3)
         );
         assert_eq!(query_params(None), (None, DEFAULT_SEARCH_LIMIT));
+        // Values are percent-decoded.
+        assert_eq!(
+            query_params(Some("country=n%5A&limit=%31%30")),
+            (Some("NZ".to_string()), 10)
+        );
+        // An empty country means none; a bad limit falls back to the default.
+        assert_eq!(
+            query_params(Some("q=a%26b&country=&limit=many")),
+            (None, DEFAULT_SEARCH_LIMIT)
+        );
     }
 
     #[tokio::test]
@@ -1281,7 +1506,7 @@ mod tests {
         let (_, headers, _) = get_full(&format!("{}/search?q=1+George+Street", c.base)).await;
         assert_eq!(route_of(&headers), (Some("filter-street"), Some("AU")));
 
-        // The same street in three countries merges by score as before, every item tagged.
+        // The same street in three countries is merged, every item tagged.
         let (_, headers, body) = get_full(&format!("{}/search?q=1+King+St", c.base)).await;
         assert_eq!(route_of(&headers), (Some("fanout"), None));
         let countries: Vec<_> = body["results"]
@@ -1480,6 +1705,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_shedding_runtime_is_not_asked_again_and_keeps_its_retry_after() {
+        let hit = json!({ "label": "found", "score": 1.0 });
+        let c = countries([hit, Value::Null, Value::Null]).await;
+        c.nz.fail_with.store(503, Ordering::SeqCst);
+        c.nz.retry_after.store(true, Ordering::SeqCst);
+
+        // Routed to NZ, which sheds: the client gets that 503 and nobody is asked twice.
+        let (status, headers, _) = get_full(&format!(
+            "{}/geocode?address=15+Eruera+Street&locality=Rotorua",
+            c.base
+        ))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::RETRY_AFTER], "2");
+        assert_eq!(route_of(&headers), (Some("filter-street-town"), Some("NZ")));
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (0, 1, 0));
+
+        // Fanned out and every Runtime shedding: the first one's 503 and Retry-After, not a 502.
+        for fake in [&c.au, &c.ca] {
+            fake.fail_with.store(503, Ordering::SeqCst);
+            fake.retry_after.store(true, Ordering::SeqCst);
+        }
+        let (status, headers, _) = get_full(&format!("{}/geocode?address=1+King+St", c.base)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::RETRY_AFTER], "2");
+    }
+
+    #[tokio::test]
     async fn a_client_error_is_passed_through_routed_or_not() {
         let c = countries([Value::Null, Value::Null, Value::Null]).await;
 
@@ -1648,5 +1901,126 @@ mod tests {
 
         // The newer filter wins however the two finished.
         assert_eq!(state.decide(&at_nz), Decision::Street("NZ".to_string()));
+    }
+
+    fn answer(query: &str, items: Value) -> Value {
+        json!({ "query": query, "results": items })
+    }
+
+    fn labels_and_countries(merged: &Value) -> Vec<(String, String)> {
+        merged["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|r| {
+                (
+                    r["label"].as_str().unwrap_or_default().to_string(),
+                    r["country"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_prefers_full_coverage_over_a_larger_score() {
+        let merged = merge(
+            vec![
+                (
+                    "AU".to_string(),
+                    answer(
+                        "10 King Street",
+                        json!([{ "label": "King Street Mall", "score": 900.0 }]),
+                    ),
+                ),
+                (
+                    "NZ".to_string(),
+                    answer(
+                        "10 King Street",
+                        json!([{ "label": "10 King Street, Auckland", "score": 0.5 }]),
+                    ),
+                ),
+            ],
+            "results",
+            10,
+            false,
+        );
+        assert_eq!(
+            labels_and_countries(&merged),
+            vec![
+                ("10 King Street, Auckland".to_string(), "NZ".to_string()),
+                ("King Street Mall".to_string(), "AU".to_string()),
+            ]
+        );
+        assert_eq!(merged["query"], "10 King Street");
+    }
+
+    #[test]
+    fn merge_interleaves_equal_coverage_by_rank_and_cuts_to_limit() {
+        let street = |score: f64| json!({ "label": "Main Street", "score": score });
+        let merged = merge(
+            vec![
+                (
+                    "AU".to_string(),
+                    answer(
+                        "main street",
+                        json!([street(9.0), street(8.0), street(7.0)]),
+                    ),
+                ),
+                (
+                    "NZ".to_string(),
+                    answer("main street", json!([street(1.0), street(0.5)])),
+                ),
+            ],
+            "results",
+            4,
+            false,
+        );
+        let order: Vec<_> = merged["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|r| (r["country"].clone(), r["score"].clone()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (json!("AU"), json!(9.0)),
+                (json!("NZ"), json!(1.0)),
+                (json!("AU"), json!(8.0)),
+                (json!("NZ"), json!(0.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_matches_a_prefix_only_for_the_last_autocomplete_token() {
+        let answers = |query: &str| {
+            vec![
+                (
+                    "AU".to_string(),
+                    answer(query, json!([{ "label": "Main Road", "score": 50.0 }])),
+                ),
+                (
+                    "NZ".to_string(),
+                    answer(query, json!([{ "label": "Main Street", "score": 1.0 }])),
+                ),
+            ]
+        };
+        let first = |merged: Value| labels_and_countries(&merged)[0].1.clone();
+
+        // "str" is the last token and a prefix of "street": NZ covers the whole query.
+        assert_eq!(first(merge(answers("main str"), "results", 10, true)), "NZ");
+        // Search matches whole tokens only, so both cover half and the score decides.
+        assert_eq!(
+            first(merge(answers("main str"), "results", 10, false)),
+            "AU"
+        );
+        // A prefix that is not the last token does not count.
+        assert_eq!(first(merge(answers("str main"), "results", 10, true)), "AU");
+    }
+
+    #[test]
+    fn coverage_is_zero_for_an_empty_query() {
+        assert_eq!(coverage(&tokens("  -- "), None, "Main Street", true), 0.0);
     }
 }
