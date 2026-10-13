@@ -59,6 +59,13 @@ pub struct ServeOptions {
 /// How long an API request waits for a blocking-pool slot before it is shed with 503.
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a chunk of a `/geocode/batch` that is not its first waits for a blocking-pool slot. A
+/// batch the pool admitted is not a new arrival: it already holds work, and its chunks queue
+/// behind the single requests and other batches' chunks that came between, so with
+/// [`QUEUE_TIMEOUT`] the tail of a busy page would be shed. It still ends, so a pool that has
+/// stopped answers `overloaded` for the rest rather than holding the request for ever.
+const BATCH_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Items of a `/geocode/batch` that share one blocking-pool slot. Small, so that a batch takes its
 /// slots one chunk at a time and requests that arrive meanwhile queue behind a chunk (a few
 /// milliseconds) rather than behind the batch; large enough that the slot and the task cost
@@ -81,6 +88,8 @@ pub(crate) struct AppState {
     /// under a burst and queue requests without limit.
     permits: Arc<Semaphore>,
     queue_timeout: Duration,
+    /// What a batch's chunks after its first wait for a slot, see [`BATCH_CHUNK_TIMEOUT`].
+    batch_chunk_timeout: Duration,
 }
 
 /// The `routing/filter` section as the Pack holds it. `bytes` is a slice of the mapped file, so
@@ -121,6 +130,7 @@ impl AppState {
             ready: Arc::new(AtomicBool::new(true)),
             permits: Arc::new(Semaphore::new(default_max_concurrency().get())),
             queue_timeout: QUEUE_TIMEOUT,
+            batch_chunk_timeout: BATCH_CHUNK_TIMEOUT,
         })
     }
 
@@ -407,13 +417,9 @@ fn internal(cause: impl std::fmt::Display, request_id: &Option<String>) -> Probl
 async fn acquire_permit(
     state: &AppState,
     request_id: &Option<String>,
+    wait: Duration,
 ) -> Result<OwnedSemaphorePermit, Problem> {
-    match tokio::time::timeout(
-        state.queue_timeout,
-        Arc::clone(&state.permits).acquire_owned(),
-    )
-    .await
-    {
+    match tokio::time::timeout(wait, Arc::clone(&state.permits).acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(closed)) => Err(internal(closed, request_id)),
         Err(_) => Err(with_id(Problem::overloaded(), request_id)),
@@ -452,7 +458,7 @@ async fn search(
         limit: params.limit,
         layer: params.layer,
     };
-    let permit = acquire_permit(&state, &request_id).await?;
+    let permit = acquire_permit(&state, &request_id, state.queue_timeout).await?;
     let searcher = Arc::clone(&state.searcher);
     let hits = task::spawn_blocking(move || {
         let _permit = permit;
@@ -488,7 +494,7 @@ async fn geocode(
         .into_options()
         .map_err(|problem| with_id(problem, &request_id))?;
 
-    let permit = acquire_permit(&state, &request_id).await?;
+    let permit = acquire_permit(&state, &request_id, state.queue_timeout).await?;
     let searcher = Arc::clone(&state.searcher);
     let response = task::spawn_blocking(move || {
         let _permit = permit;
@@ -565,7 +571,12 @@ async fn geocode_batch(
         let permit = if shed {
             None
         } else {
-            match acquire_permit(&state, &request_id).await {
+            let wait = if chunks.is_empty() {
+                state.queue_timeout
+            } else {
+                state.batch_chunk_timeout
+            };
+            match acquire_permit(&state, &request_id, wait).await {
                 Ok(permit) => Some(permit),
                 // Nothing has run yet, so the whole request is shed.
                 Err(problem) if chunks.is_empty() => return Err(problem),
@@ -682,7 +693,7 @@ async fn autocomplete(
         limit: params.limit,
         layer: params.layer,
     };
-    let permit = acquire_permit(&state, &request_id).await?;
+    let permit = acquire_permit(&state, &request_id, state.queue_timeout).await?;
     let searcher = Arc::clone(&state.searcher);
     let hits = task::spawn_blocking(move || {
         let _permit = permit;
@@ -714,7 +725,7 @@ async fn reverse(
     bounds::validate_coords(params.lon, params.lat)
         .map_err(|problem| with_id(problem, &request_id))?;
 
-    let permit = acquire_permit(&state, &request_id).await?;
+    let permit = acquire_permit(&state, &request_id, state.queue_timeout).await?;
     let geocoder = Arc::clone(&state.reverse_geocoder);
     let response = task::spawn_blocking(move || {
         let _permit = permit;
@@ -1301,6 +1312,7 @@ mod router_tests {
         let mut state = state_for(&pack, true);
         state.permits = Arc::new(Semaphore::new(1));
         state.queue_timeout = Duration::ZERO;
+        state.batch_chunk_timeout = Duration::ZERO;
         let router = build_router(state, &demo, &no_basemap);
 
         let count = BATCH_CHUNK * 12;
@@ -1333,6 +1345,40 @@ mod router_tests {
                 .zip(&shed)
                 .all(|(result, shed)| *shed || result["result"]["layer"] == "address")
         );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_waits_longer_for_the_slots_of_its_later_chunks() {
+        let pack = temp_path("batch-later-chunks");
+        write_pack(&pack);
+        let demo = temp_path("batch-later-chunks-demo");
+        let no_basemap = temp_path("batch-later-chunks-no-basemap");
+        // One slot and no patience for a new request: the first chunk takes the slot, and each
+        // later one has to wait for the chunk before it. The batch was admitted, so it waits.
+        let mut state = state_for(&pack, true);
+        state.permits = Arc::new(Semaphore::new(1));
+        state.queue_timeout = Duration::ZERO;
+        let router = build_router(state, &demo, &no_basemap);
+
+        let count = BATCH_CHUNK * 12;
+        let items = vec![serde_json::json!({ "address": "10 King Street" }); count];
+        let reply = send(
+            router,
+            post(
+                "/geocode/batch",
+                serde_json::json!({ "items": items }).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let results = body["results"].as_array().expect("results");
+        assert_eq!(results.len(), count);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result["result"]["layer"], "address", "item {i}");
+        }
 
         let _ = std::fs::remove_dir_all(&pack);
     }
