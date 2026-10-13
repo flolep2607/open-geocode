@@ -197,6 +197,11 @@ The answer is `{"results": [...]}` with one entry per item, **in the order of th
 - `{"problem": {...}}` is the Problem Details object (`status`, `error_code`, `detail`, `request_id`, `invalid_params`) `GET /geocode` would have answered, for an item that is not valid (an empty `address`, a `limit` above 50, a text over 256 characters, a field of the wrong type) or that fails.
   One bad item does not fail the others: the request itself fails only when its body is not a batch (`400 malformed_parameter`) or is too large (`413 batch_too_large`).
 - Through the router an entry also has `route` (what `x-route` says for a GET: `filter-street-town`, `filter-street`, `prefer`, `prefer-fallback`, `fanout` or `country`), and a result has its `country`, also when the item named the country.
+  The one entry without a `route` is the `unknown_country` Problem: the item named a `country` the router has no Runtime for, and nobody was asked.
+- Through the router an entry with `"result": null` also has a top-level `country`, the country of the Runtime that found nothing, so that a client that falls back to a postcode or a town can do it in that country: `{"query": ..., "result": null, "country": "NZ", "route": "country"}`.
+  It is there when one Runtime alone answered the item: the one named by `country`, the routed one when it is the only Runtime, or the only one that answered after the others failed.
+  When several Runtimes said null (a fan-out, or a routed Runtime followed by the others) there is no one country to name and the entry has none.
+  A found result keeps its `country` inside the result, and the entry has no top-level one.
 
 Limits: at most 1000 items and 4 MiB per request.
 Both are 413 Problems above the limit; a client with more addresses sends several batches.
@@ -207,16 +212,33 @@ Every response has the `x-request-id` header, and an item's Problem carries the 
 The items run in parallel on the blocking pool, in chunks of 16, each chunk holding one of the `--max-concurrency` slots that a `/geocode` request holds.
 A batch is therefore held to the same limit as the single routes, however large it is, and shares the slots with them in arrival order; one slot for the whole batch would let a request use every core and count as one.
 A batch that cannot get its first slot within 2 s is shed whole (503 with `Retry-After: 1`).
-One that got some slots and then none answers an `overloaded` Problem (`status` 503) for the items it did not run, and keeps the answers it has; the client retries those items.
+A batch that got its first slot is not a new arrival, so each later chunk waits up to 30 s for its slot.
+One that still gets none answers an `overloaded` Problem (`status` 503) for the items it did not run, and keeps the answers it has; the client retries those items.
+A lookup that panics is that item's `internal_error` Problem and does not fail the others.
 Each batch is logged at info level as `geocode batch` with its `items`, `found`, `not_found` and `problems`.
 
 **On the router.**
 Each item is decided as `GET /geocode` decides it: its `country`, else the filters and `prefer`, else every Runtime.
 The items for the same Runtime are sent as one sub-batch, all Runtimes at once, and an item that goes to every Runtime is in each one's.
-The answers are put back in the order of the items and picked as for a GET: the one non-null answer, a Problem for an item that is the client's (a bad field, an unknown `country`, an address several countries answer: `country_required`), and a routed Runtime that finds nothing or fails is followed by the others (not asked a second time).
-An item that named its `country` is asked of that Runtime only.
-A Runtime that does not answer its sub-batch fails only its items, with an `upstream_unavailable` Problem (`overloaded` if it shed load); the items for the other Runtimes are answered.
+The answers are put back in the order of the items and picked as for a GET: the one non-null answer, a Problem for an item that is the client's (a bad field, an address several countries answer: `country_required`), and a routed Runtime that finds nothing or fails is followed by the others (not asked a second time).
+An item that named its `country` is asked of that Runtime only, and a `country` the router has no Runtime for is an `unknown_country` Problem, asked of nobody.
+An item that is not an object, or has no non-empty string `address`, is answered by the router itself with the Problem a Runtime would give (`malformed_parameter`, `invalid_query`), with the `route` it would have taken, and is not sent to any Runtime.
+
+What happens when a Runtime does not give a usable answer for its items:
+
+- A Runtime that does not answer its sub-batch, refuses it (any status but 2xx), or answers something that is not one result object per item, gives no answer for any of its items.
+  One that sheds load (a 503 with `Retry-After`) is not asked again: its items are answered `overloaded` (`status` 503), and the router still answers 200 with those items inside, not a 503 for the request.
+- Any other failure of a routed Runtime is retried elsewhere, as on GET, for the items that did not name a `country`: the other Runtimes are asked, and the item is answered by them, or `upstream_unavailable` (`status` 502) if none answers.
+  An item that named its `country` is answered `upstream_unavailable` right away.
+- The other Runtimes' items are unaffected.
+
+Each stage (the first sub-batches, then the retries) waits up to 30 s for its Runtimes, so a request can take up to 60 s.
+A client should keep its request timeout above 60 s (90 s, say), or it gives up on a page the router is still working on.
 The router's request id goes to every Runtime as `x-request-id`.
+
+**Deploying.**
+Upgrade the Runtimes before the router.
+A Runtime without this endpoint answers `POST /geocode/batch` with a 405, and a router that is ahead of it would answer `upstream_unavailable` for every item it routes there.
 
 ## Hosted demo
 
