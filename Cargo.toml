@@ -39,6 +39,8 @@ tokio = { version = "1.45", features = ["macros", "net", "rt-multi-thread"] }
 tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+# Membership filter over street keys, written into the Pack for the router (`routing/filter`).
+xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
 
 [dev-dependencies]
 # Used only by the in-crate router tests to drive the Router via `oneshot`.

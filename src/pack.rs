@@ -33,6 +33,7 @@ use crate::{
     memory::MemoryBudget,
     record::{AddressRecord, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
+    routing::{PlaceTowns, RoutingKeyWriter, record_keys},
     spatial_index::{RecordCells, SpatialIndexWriter},
     text_index::TextIndexWriter,
 };
@@ -114,6 +115,11 @@ pub struct PackWriter {
     contexts: ContextTupleWriter,
     text: TextIndexWriter,
     spatial: SpatialIndexWriter,
+    /// Street keys of every record, for the routing filter section.
+    routing: RoutingKeyWriter,
+    /// Town names of the boundary places written so far, kept outside the memory pool like the
+    /// boundary polygons: 16 bytes per admin place.
+    places: PlaceTowns,
     layer_counts: BTreeMap<Layer, u64>,
 }
 
@@ -146,6 +152,11 @@ pub struct PackBuildStats {
     pub sections: BTreeMap<String, u64>,
     pub spatial_pair_runs: u64,
     pub text_index_bytes: u64,
+    /// Routing keys pushed to the sorter, duplicates included, and the runs it spilled.
+    pub routing_key_items: u64,
+    pub routing_key_runs: u64,
+    /// Unique keys in the routing filter; 0 when the Pack has none.
+    pub routing_filter_keys: u64,
 }
 
 impl PackWriter {
@@ -174,6 +185,14 @@ impl PackWriter {
                 options.text_index_memory_bytes,
             )?,
             spatial: SpatialIndexWriter::new(&scratch, &options.memory, options.sort_budget_bytes),
+            // The share the spatial context sorter takes: keys are 8 bytes each, far fewer than
+            // the fine cell pairs.
+            routing: RoutingKeyWriter::new(
+                &scratch,
+                &options.memory,
+                options.sort_budget_bytes / 8,
+            ),
+            places: PlaceTowns::default(),
             scratch,
             destination,
             generation,
@@ -207,18 +226,22 @@ impl PackWriter {
     pub fn write_batch(&mut self, batch: &[(Record, Option<RecordContext>)]) -> Result<()> {
         let first = self.records.record_count();
         let fields = self.text.fields();
+        let places = &self.places;
         let prepared = batch
             .par_iter()
             .enumerate()
-            .map(|(offset, (record, _))| {
+            .map(|(offset, (record, context))| {
                 let record_id = first + offset as u64;
                 Ok((
                     fields.document(record_id, record),
                     RecordCells::for_record(record_id, record)?,
+                    record_keys(record, context.as_ref(), places),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for ((record, context), (document, cells)) in batch.iter().zip(prepared) {
+        for (offset, ((record, context), (document, cells, keys))) in
+            batch.iter().zip(prepared).enumerate()
+        {
             let context = match context {
                 Some(context) => self.contexts.intern(*context)?,
                 None => None,
@@ -226,6 +249,10 @@ impl PackWriter {
             self.records.write(record, context)?;
             self.text.add(document)?;
             self.spatial.add(cells)?;
+            self.routing.add(&keys)?;
+            if let Record::Place(layer, place) = record {
+                self.places.note(first + offset as u64, *layer, &place.name);
+            }
             *self.layer_counts.entry(record.layer()).or_default() += 1;
         }
         Ok(())
@@ -241,8 +268,11 @@ impl PackWriter {
             contexts,
             text,
             spatial,
+            routing,
+            places,
             layer_counts,
         } = self;
+        drop(places);
         let path = generation.path.join(PACK_FILE);
         let mut pack = ContainerWriter::create(&path)?;
         let record_count = records.record_count();
@@ -253,6 +283,7 @@ impl PackWriter {
         contexts.finish(&mut pack)?;
         let text_commit = text.finish(&mut pack)?;
         let spatial_commit = spatial.finish(&mut pack)?;
+        let routing_commit = routing.finish(&mut pack)?;
 
         let manifest = PackManifest {
             schema_version: PACK_SCHEMA_VERSION,
@@ -303,6 +334,9 @@ impl PackWriter {
                 spatial_pair_runs: spatial_commit.fine_pairs.runs
                     + spatial_commit.context_pairs.runs,
                 text_index_bytes: text_commit.bytes,
+                routing_key_items: routing_commit.items,
+                routing_key_runs: routing_commit.runs,
+                routing_filter_keys: routing_commit.key_count,
             },
         ))
     }
@@ -520,7 +554,12 @@ mod tests {
 
     use crate::{
         record::{
-            AddressComponents, LocationPrecision, OsmObjectType, SourceProvenance, point_geometry,
+            AddressComponents, InterpolationAddressComponents, InterpolationRange,
+            LocationPrecision, OsmObjectType, PlaceRecord, SourceProvenance, point_geometry,
+        },
+        routing::{
+            ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION, RoutingFilter, pair_hash, street_hash,
+            town_hash,
         },
         search::{PackTextSearcher, TextSearchOptions},
     };
@@ -612,6 +651,11 @@ mod tests {
         assert!(sections.contains_key("records/blocks"));
         assert!(sections.keys().any(|name| name.starts_with("text/")));
         assert!(sections.contains_key("spatial/fine/data"));
+        assert!(
+            sections.contains_key("routing/filter"),
+            "{:?}",
+            sections.keys()
+        );
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
 
         // The Pack file alone is a complete Pack.
@@ -619,6 +663,141 @@ mod tests {
         fs::copy(reader.path(), &copy).expect("copy");
         assert_eq!(first_hit(&copy, "king").as_deref(), Some("osm:node:1"));
         assert!(!reader.path().parent().unwrap().join(SCRATCH_DIR).exists());
+    }
+
+    fn routing_filter(reader: &PackReader) -> Option<RoutingFilter<Vec<u8>>> {
+        reader
+            .container()
+            .optional_section(ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION)
+            .expect("section")
+            .map(|bytes| RoutingFilter::parse(bytes.as_slice().to_vec()).expect("parse"))
+    }
+
+    #[test]
+    fn routing_filter_holds_the_street_and_town_keys_of_every_kind_of_record() {
+        let root = temp_root("routing");
+        let mut writer = PackWriter::create(&root).expect("writer");
+        // The boundary is written before the address that sits in it, as the OSM builder does.
+        let rotorua = writer
+            .write(
+                &Record::Place(
+                    crate::record::PlaceLayer::Locality,
+                    PlaceRecord {
+                        name: "Rotorua".to_string(),
+                        place_type: "city".to_string(),
+                        geometry: point_geometry(176.25, -38.14),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 7),
+                    },
+                ),
+                None,
+            )
+            .expect("place");
+        let in_rotorua = RecordContext {
+            admin_context: AdminContextTuple {
+                locality_record_id: Some(rotorua),
+                ..AdminContextTuple::default()
+            },
+            flags: 0,
+        };
+        writer
+            .write(&address_record(1, "15", "Eruera St"), Some(in_rotorua))
+            .expect("boundary town");
+        let Record::Address(mut king) = address_record(2, "10", "King Street") else {
+            unreachable!()
+        };
+        king.address.locality = Some("Toronto".to_string());
+        writer.write(&king.into(), None).expect("own locality");
+        writer
+            .write(
+                &Record::Interpolation(InterpolationRecord {
+                    address: InterpolationAddressComponents {
+                        street: Some("Elm Street".to_string()),
+                        place: None,
+                        locality: Some("Toronto".to_string()),
+                        region: None,
+                        postcode: None,
+                        country: None,
+                    },
+                    interpolation: InterpolationRange {
+                        kind: "even".to_string(),
+                        start: 2,
+                        end: 10,
+                        step: 2,
+                    },
+                    anchor_node_ids: [1, 2],
+                    geometry: geojson::Geometry::new(geojson::GeometryValue::LineString {
+                        coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+                    }),
+                    representative_point: [-79.0, 43.0005],
+                    source: SourceProvenance::osm(OsmObjectType::Way, 3),
+                }),
+                None,
+            )
+            .expect("interpolation");
+        writer
+            .write(
+                &Record::Street(StreetRecord {
+                    name: "Queen Street".to_string(),
+                    geometry: geojson::Geometry::new(geojson::GeometryValue::LineString {
+                        coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+                    }),
+                    representative_point: [-79.0, 43.0005],
+                    source: SourceProvenance::osm(OsmObjectType::Way, 4),
+                }),
+                Some(in_rotorua),
+            )
+            .expect("street");
+        writer.finish().expect("finish");
+
+        let reader = PackReader::open(&root).expect("reader");
+        let filter = routing_filter(&reader).expect("filter");
+        let street = |name: &str| street_hash(name).expect("street");
+        let pair = |name: &str, town: &str| {
+            filter.maybe_contains(pair_hash(street(name), town_hash(town).expect("town")))
+        };
+        for name in ["Eruera Street", "King Street", "Elm Street", "Queen Street"] {
+            assert!(filter.maybe_contains(street(name)), "{name}");
+        }
+        assert!(pair("Eruera Street", "Rotorua"), "town from the boundary");
+        assert!(pair("King Street", "Toronto"), "own locality");
+        assert!(pair("Elm Street", "Toronto"), "interpolation");
+        assert!(
+            pair("Queen Street", "Rotorua"),
+            "street record with a boundary"
+        );
+        assert!(!pair("King Street", "Rotorua"));
+        assert!(!filter.maybe_contains(street("Unknown Avenue")));
+        // 4 streets, 4 street|town pairs.
+        assert_eq!(filter.key_count(), 8);
+    }
+
+    #[test]
+    fn a_pack_without_streets_has_no_routing_filter_and_still_opens() {
+        let root = temp_root("no-routing");
+        let mut writer = PackWriter::create(&root).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    crate::record::PlaceLayer::Locality,
+                    PlaceRecord {
+                        name: "Rotorua".to_string(),
+                        place_type: "city".to_string(),
+                        geometry: point_geometry(176.25, -38.14),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 7),
+                    },
+                ),
+                None,
+            )
+            .expect("place");
+        writer.finish().expect("finish");
+        let reader = PackReader::open(&root).expect("a Pack without the section opens");
+        reader.verify().expect("verify");
+        assert!(!reader.section_sizes().contains_key(ROUTING_FILTER_SECTION));
+        assert!(routing_filter(&reader).is_none());
+        assert_eq!(
+            first_hit(&root, "rotorua").as_deref(),
+            Some("osm:relation:7")
+        );
     }
 
     #[test]
@@ -716,6 +895,32 @@ mod tests {
 
         let error = sealed.publish().unwrap_err();
         assert!(format!("{error:#}").contains("checksum"), "{error:#}");
+        assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
+    }
+
+    #[test]
+    fn publishing_refuses_a_pack_with_a_corrupted_routing_filter() {
+        let root = temp_root("routing-corrupt");
+        write_pack(&root, &[address_record(1, "10", "King Street")]);
+        let published = fs::read(root.join("CURRENT")).expect("pointer");
+
+        let mut replacement = PackWriter::create(&root).expect("replacement");
+        replacement
+            .write(&address_record(2, "20", "Queen Street"), None)
+            .expect("address");
+        let (sealed, _) = replacement.seal().expect("seal");
+        let pack = sealed.generation().join(PACK_FILE);
+        let info = Container::open(&pack).expect("open").sections()[ROUTING_FILTER_SECTION].clone();
+        let mut bytes = fs::read(&pack).expect("read");
+        // A byte of the fingerprints, past the 16-byte header and the descriptor.
+        bytes[info.offset as usize + 40] ^= 0x55;
+        fs::write(&pack, &bytes).expect("corrupt");
+
+        let error = sealed.publish().unwrap_err();
+        assert!(
+            format!("{error:#}").contains(ROUTING_FILTER_SECTION),
+            "{error:#}"
+        );
         assert_eq!(fs::read(root.join("CURRENT")).expect("pointer"), published);
     }
 

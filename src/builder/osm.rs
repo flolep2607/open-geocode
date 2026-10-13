@@ -372,6 +372,13 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
                 runs: stats.spatial_pair_runs,
             },
         ),
+        (
+            "routing_keys",
+            SortStats {
+                items: stats.routing_key_items,
+                runs: stats.routing_key_runs,
+            },
+        ),
     ] {
         report.scratch.sorters.insert(
             name.to_string(),
@@ -384,6 +391,7 @@ pub fn build_osm_pack(options: BuildOsmOptions) -> Result<BuilderReport> {
     report.output.pack_bytes = stats.bytes;
     report.output.record_count = sealed.manifest().record_count;
     report.output.text_index_bytes = stats.text_index_bytes;
+    report.output.routing_filter_keys = stats.routing_filter_keys;
     report.output.sections = stats.sections;
     report.output.rejection_count = audit.count;
     report.phases.total_ms = started.elapsed().as_millis();
@@ -550,6 +558,10 @@ mod tests {
         pack::PackReader,
         record::{OsmObjectType, SourceProvenance},
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
+        routing::{
+            ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION, RoutingFilter, pair_hash,
+            query_street_hash, street_hash, town_hash,
+        },
         search::{PackTextSearcher, TextSearchOptions},
     };
 
@@ -710,6 +722,23 @@ mod tests {
         ]
     }
 
+    /// The routing filter of a built Pack, over a copy of its bytes.
+    fn routing_filter(reader: &PackReader) -> RoutingFilter<Vec<u8>> {
+        let section = reader
+            .container()
+            .optional_section(ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION)
+            .expect("section")
+            .expect("a Pack with addresses has a routing filter");
+        RoutingFilter::parse(section.as_slice().to_vec()).expect("parse")
+    }
+
+    fn holds_street_in(filter: &RoutingFilter<Vec<u8>>, street: &str, town: &str) -> bool {
+        filter.maybe_contains(pair_hash(
+            street_hash(street).expect("street"),
+            town_hash(town).expect("town"),
+        ))
+    }
+
     fn build(root: &Path, input: &Path, memory_budget_bytes: usize) -> BuilderReport {
         build_osm_pack(BuildOsmOptions {
             input: input.to_path_buf(),
@@ -843,6 +872,36 @@ mod tests {
             street.label
         );
 
+        // The routing filter holds the streets of every kind of record, each with the towns that
+        // contain it: its own locality, or a boundary.
+        let filter = routing_filter(&reader);
+        assert_eq!(report.output.routing_filter_keys, filter.key_count());
+        assert!(report.output.sections.contains_key(ROUTING_FILTER_SECTION));
+        for street in ["King Street", "Queen Street", "Elm Street", "Bay Street"] {
+            assert!(
+                filter.maybe_contains(street_hash(street).unwrap()),
+                "{street}"
+            );
+        }
+        assert!(
+            holds_street_in(&filter, "King Street", "Toronto"),
+            "own locality"
+        );
+        assert!(
+            holds_street_in(&filter, "Queen Street", "Toronto"),
+            "street record"
+        );
+        assert!(
+            holds_street_in(&filter, "Elm Street", "Toronto"),
+            "interpolation"
+        );
+        assert!(
+            holds_street_in(&filter, "Bay Street", "Bay Ward Relation"),
+            "a town taken from the boundary around the record"
+        );
+        assert!(!holds_street_in(&filter, "King Street", "Montreal"));
+        assert!(!filter.maybe_contains(street_hash("Nowhere Avenue").unwrap()));
+
         // Rejections go to the build audit, not the Pack.
         let rejections = reader.rejections(0).expect("rejections");
         let reasons = rejections
@@ -924,6 +983,10 @@ mod tests {
         let address = reader.address(row).expect("record").expect("address");
         assert_eq!(address.source, SourceProvenance::row("oa", 1));
         assert_eq!(address.address.postcode.as_deref(), Some("M5T 9Z9"));
+        // Imported rows are keyed like OSM ones: the street of a typed address finds them.
+        let filter = routing_filter(&reader);
+        assert!(filter.maybe_contains(query_street_hash("12 Spadina Ave").unwrap()));
+        assert!(holds_street_in(&filter, "Spadina Avenue", "Toronto"));
         let context = reader
             .boundary_context(row)
             .expect("context")
@@ -1038,6 +1101,20 @@ mod tests {
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count
+        );
+        let filter_bytes = |reader: &PackReader| {
+            reader
+                .container()
+                .optional_section(ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION)
+                .expect("section")
+                .expect("filter")
+                .as_slice()
+                .to_vec()
+        };
+        assert_eq!(
+            filter_bytes(&memory),
+            filter_bytes(&spilled),
+            "sorted unique keys and a fixed seed give the same filter either way"
         );
         for id in 0..memory.manifest().record_count {
             assert_eq!(

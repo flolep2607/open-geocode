@@ -185,6 +185,9 @@ pub struct PackOutputReport {
     pub pack_bytes: u64,
     pub record_count: u64,
     pub text_index_bytes: u64,
+    /// Unique keys of the routing filter section; 0 when the Pack has none.
+    #[serde(default)]
+    pub routing_filter_keys: u64,
     pub rejection_count: u64,
     pub sections: BTreeMap<String, u64>,
 }

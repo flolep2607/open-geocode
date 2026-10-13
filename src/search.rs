@@ -643,7 +643,7 @@ fn address_geocode_candidates(address: &str, postcode: Option<&str>) -> Vec<Stri
 /// dropped, with whatever precedes them ("Level 3, 100 George St"), but an
 /// ordinal street name such as "8th Street" is kept. A numeric street name
 /// ("12 10 Mile Road") loses its number and so matches nothing.
-fn street_fallback_query(address: &str) -> Option<String> {
+pub(crate) fn street_fallback_query(address: &str) -> Option<String> {
     let expanded = expand_address_abbreviations(&normalize_index_text(address)?);
     let stripped = strip_unit_terms(&expanded)?;
     let tokens = stripped.split_whitespace().collect::<Vec<_>>();
@@ -698,7 +698,7 @@ fn collapse_query(value: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-fn expand_address_abbreviations(value: &str) -> String {
+pub(crate) fn expand_address_abbreviations(value: &str) -> String {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     let mut expanded = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
@@ -754,7 +754,7 @@ fn previous_token_is_street_type(tokens: &[&str]) -> bool {
     })
 }
 
-fn strip_unit_terms(value: &str) -> Option<String> {
+pub(crate) fn strip_unit_terms(value: &str) -> Option<String> {
     split_unit_terms(value).1
 }
 

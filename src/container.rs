@@ -241,6 +241,16 @@ impl Container {
         Ok(self.bytes_of(info))
     }
 
+    /// Like [`Self::section`], for a section a Pack may not have: `None` when it is absent, so a
+    /// Pack built before the section existed still opens. A section that is present with another
+    /// version is an error, and the caller decides whether that is fatal.
+    pub fn optional_section(&self, name: &str, version: u32) -> Result<Option<Bytes>> {
+        if !self.sections.contains_key(name) {
+            return Ok(None);
+        }
+        self.section(name, version).map(Some)
+    }
+
     /// Bytes of a section whose format is owned by another library (Tantivy).
     pub fn raw_section(&self, name: &str) -> Result<Bytes> {
         Ok(self.bytes_of(self.info(name)?))
@@ -370,6 +380,41 @@ mod tests {
         let error = container.section("alpha", 2).unwrap_err().to_string();
         assert!(error.contains("rebuild the Pack"), "{error}");
         assert!(container.section("missing", 1).is_err());
+    }
+
+    #[test]
+    fn optional_sections_are_none_when_absent_and_errors_on_another_version() {
+        let path = temp_file("optional");
+        let mut writer = ContainerWriter::create(&path).expect("writer");
+        writer.add("alpha", 1, b"abc").expect("alpha");
+        // A section no reader of this build knows: the table of contents lists it like any other.
+        writer.add("future/extra", 9, b"ignored").expect("extra");
+        writer.finish().expect("finish");
+
+        let container =
+            Container::open(&path).expect("an unknown section does not stop a Pack opening");
+        container
+            .verify()
+            .expect("and it is checksummed like the others");
+        assert!(
+            container
+                .optional_section("missing", 1)
+                .expect("absent")
+                .is_none()
+        );
+        assert_eq!(
+            container
+                .optional_section("alpha", 1)
+                .expect("alpha")
+                .expect("present")
+                .as_slice(),
+            b"abc"
+        );
+        let error = container
+            .optional_section("alpha", 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rebuild the Pack"), "{error}");
     }
 
     #[test]

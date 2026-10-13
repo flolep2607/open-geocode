@@ -12,6 +12,9 @@ pub mod record;
 pub mod records;
 pub mod reverse;
 pub mod route;
+// The reader side is first used by the Runtime and the router.
+#[allow(dead_code)]
+mod routing;
 pub mod runtime;
 pub mod search;
 pub mod spatial_index;
