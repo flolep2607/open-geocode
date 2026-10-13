@@ -1152,6 +1152,7 @@ fn settle(country: &str, named: bool, reply: Reply, id: Option<&str>) -> Step {
         }
         Reply::Answer(mut body) => {
             tag_country(&mut body, "result", country);
+            tag_null_country(&mut body, country);
             Step::Done(body)
         }
         Reply::Problem(problem) if named || problem["status"] != 500 => {
@@ -1162,6 +1163,14 @@ fn settle(country: &str, named: bool, reply: Reply, id: Option<&str>) -> Step {
             Step::Done(problem_item(Problem::upstream_unavailable(country), id))
         }
         Reply::Problem(_) | Reply::Failed { .. } => Step::Elsewhere(None),
+    }
+}
+
+/// A null `result` has nowhere to carry the country that found nothing, so the entry does: a client
+/// that falls back to a postcode or a town needs to know in which country.
+fn tag_null_country(body: &mut Value, country: &str) {
+    if body.get("result").is_some_and(Value::is_null) {
+        body["country"] = country.into();
     }
 }
 
@@ -1194,8 +1203,19 @@ fn pick_item(
         };
         return problem_item(problem, id);
     }
+    // Only one Runtime having answered makes the null its answer to name.
+    let sole = match answers.as_slice() {
+        [(country, _)] => Some(country.clone()),
+        _ => None,
+    };
     match pick_geocode(state, answers, streets) {
-        Picked::One(body, _) | Picked::Null(body) => body,
+        Picked::One(body, _) => body,
+        Picked::Null(mut body) => {
+            if let Some(country) = sole {
+                tag_null_country(&mut body, &country);
+            }
+            body
+        }
         Picked::Ambiguous(countries) => {
             problem_item(Problem::country_ambiguous("/geocode", &countries), id)
         }
@@ -1210,7 +1230,9 @@ fn pick_item(
 ///
 /// An item answers `{ query, result, route }` or `{ problem, route }`; `route` is the `x-route` of
 /// the GET, and a result carries its `country` as routed `/geocode` results do (also when the
-/// item named the country, which GET leaves untagged). An item that is not an object, or has no non-empty string `address`, is answered here with the
+/// item named the country, which GET leaves untagged). An entry whose `result` is null carries
+/// the `country` too, when one Runtime alone answered it (the routed one, or the only one left
+/// after the others failed); when several said null there is no one country to name. An item that is not an object, or has no non-empty string `address`, is answered here with the
 /// Problem a Runtime would give, and asked of nobody. A Runtime that does not answer a sub-batch
 /// fails its items only, as `upstream_unavailable` (`overloaded` when it shed load). As on GET,
 /// an item whose routed Runtime has no answer, or fails, is then asked of the others.
@@ -2669,6 +2691,66 @@ mod tests {
             assert_eq!(fake.batches().len(), 1);
             assert_eq!(fake.batches()[0].len(), 4);
         }
+    }
+
+    #[tokio::test]
+    async fn a_null_result_names_the_country_that_alone_answered_it() {
+        // Every Runtime finds nothing.
+        let c = countries([Value::Null, Value::Null, Value::Null]).await;
+        let results = batch(
+            &c.base,
+            json!([
+                // Named: that Runtime alone was asked.
+                { "address": "1 Toronto Road", "country": "ca" },
+                // Routed to NZ by its filter, which found nothing, and the others did not either:
+                // three Runtimes said null, so none is the country.
+                { "address": "15 Eruera Street", "locality": "Rotorua" },
+                { "address": "1 King St" },
+            ]),
+        )
+        .await;
+        assert!(results[0]["result"].is_null());
+        assert_eq!(results[0]["country"], "CA");
+        assert_eq!(batch_route(&results[0]), Some("country"));
+        for result in &results[1..] {
+            assert!(result["result"].is_null());
+            assert!(result.get("country").is_none());
+            assert_eq!(batch_route(result), Some("fanout"));
+        }
+
+        // The others failing leaves the one that answered null to name.
+        c.au.fail_with.store(500, Ordering::SeqCst);
+        c.ca.fail_with.store(500, Ordering::SeqCst);
+        let results = batch(&c.base, json!([{ "address": "1 King St" }])).await;
+        assert!(results[0]["result"].is_null());
+        assert_eq!(results[0]["country"], "NZ");
+
+        // The only Runtime there is.
+        let nz = fake(
+            json!([]),
+            Value::Null,
+            Some(filter_of(&[("Eruera Street", &["Rotorua"])])),
+            StatusCode::OK,
+        )
+        .await;
+        let base = router(vec![("NZ", nz.url.clone())]).await;
+        let results = batch(
+            &base,
+            json!([{ "address": "15 Eruera Street", "locality": "Rotorua" }]),
+        )
+        .await;
+        assert!(results[0]["result"].is_null());
+        assert_eq!(results[0]["country"], "NZ");
+
+        // A result carries the country inside it, as before, and no entry-level one.
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        let results = batch(
+            &c.base,
+            json!([{ "address": "1 Toronto Road", "country": "ca" }]),
+        )
+        .await;
+        assert_eq!(results[0]["result"]["country"], "CA");
+        assert!(results[0].get("country").is_none());
     }
 
     #[tokio::test]
