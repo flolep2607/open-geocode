@@ -17,7 +17,12 @@
 //!   typed so far may be the start of another. A Runtime without a filter might hold anything,
 //!   so it blocks a single winner but never wins by default. The routed answer carries
 //!   `x-route` (`filter-street-town` or `filter-street`) and `x-route-country`, and its results
-//!   a `country`. A routed Runtime that fails, or finds nothing, does not end the request: the
+//!   a `country`.
+//! - `prefer=XX` (a hint taken from an invoice currency, which is not a fact) changes the order
+//!   when `country` is absent: a unique street|town holder still wins, even over `prefer`, since
+//!   the currency can be wrong; then `prefer` wins if it may hold the street; then a unique
+//!   street holder; then `prefer` anyway (`x-route`: `prefer`, `prefer-fallback`). A `prefer`
+//!   that is not a configured Runtime is ignored. See [`RouteState::decide`]. A routed Runtime that fails, or finds nothing, does not end the request: the
 //!   filters can be wrong, so it goes on to every Runtime.
 //! - When the filters cannot decide (zero or several Runtimes hold the street, or a request with
 //!   no street) the request goes to every Runtime at once, as before (`x-route: fanout`).
@@ -153,6 +158,10 @@ enum Decision {
     StreetTown(String),
     /// Only this country's filter holds the street.
     Street(String),
+    /// `prefer` may hold the street, and no filter showed the town is elsewhere.
+    Prefer(String),
+    /// Nothing else decided, so `prefer` is asked rather than every Runtime.
+    PreferFallback(String),
     Fanout,
 }
 
@@ -352,7 +361,20 @@ impl RouteState {
     /// For each reading of the street, street with town first, then (when `street_alone`) the
     /// street alone. Several holders, or none, decide nothing: a Runtime is never chosen because
     /// another one does not know the street, only because it is the one that does.
+    ///
+    /// With a `prefer` that is a configured Runtime the order is: a sole street|town holder, even
+    /// when it is not `prefer`, because a currency can be wrong and a town named in the address
+    /// cannot; `prefer` when its filter holds the street (or it has none); a sole street holder;
+    /// else `prefer` all the same, since it was asked for and nothing contradicts it. Without
+    /// `prefer` nothing changes.
     fn decide(&self, keys: &RouteKeys) -> Decision {
+        let prefer = keys
+            .prefer
+            .as_deref()
+            .filter(|country| self.workers.contains_key(*country));
+        if let Some(prefer) = prefer {
+            return self.decide_preferring(keys, prefer);
+        }
         for &street in &keys.streets {
             if let Some(town) = keys.town
                 && let Some(country) = self.sole_holder(pair_hash(street, town))
@@ -366,6 +388,35 @@ impl RouteState {
             }
         }
         Decision::Fanout
+    }
+
+    /// [`Self::decide`] for a `prefer` that names a configured Runtime.
+    fn decide_preferring(&self, keys: &RouteKeys, prefer: &str) -> Decision {
+        if let Some(town) = keys.town
+            && let Some(country) = keys
+                .streets
+                .iter()
+                .find_map(|&street| self.sole_holder(pair_hash(street, town)))
+        {
+            return Decision::StreetTown(country);
+        }
+        let preferred = &self.workers[prefer];
+        if keys
+            .streets
+            .iter()
+            .any(|&street| preferred.may_hold(street))
+        {
+            return Decision::Prefer(prefer.to_string());
+        }
+        if keys.street_alone
+            && let Some(country) = keys
+                .streets
+                .iter()
+                .find_map(|&street| self.sole_holder(street))
+        {
+            return Decision::Street(country);
+        }
+        Decision::PreferFallback(prefer.to_string())
     }
 
     /// One line per Runtime for the startup log.
@@ -426,6 +477,9 @@ struct RouteKeys {
     town: Option<u64>,
     /// Whether the street alone, without the town, is enough to route.
     street_alone: bool,
+    /// `prefer`, upper case: a country the caller guesses (from a currency) but does not insist
+    /// on, unlike `country`.
+    prefer: Option<String>,
 }
 
 impl RouteKeys {
@@ -435,6 +489,10 @@ impl RouteKeys {
         };
         let text = params.get(text).map(String::as_str).unwrap_or_default();
         let town = params.get("locality").and_then(|town| town_hash(town));
+        let prefer = params
+            .get("prefer")
+            .map(|prefer| prefer.trim().to_ascii_uppercase())
+            .filter(|prefer| !prefer.is_empty());
         let has_number = text
             .split_whitespace()
             .any(|token| token.chars().any(|c| c.is_ascii_digit()));
@@ -446,6 +504,7 @@ impl RouteKeys {
                 Source::Query => has_number || town.is_some(),
                 Source::Typing => false,
             },
+            prefer,
         }
     }
 }
@@ -751,8 +810,8 @@ async fn fan_out(
     }
 }
 
-/// Answer `path?raw` from the one Runtime the request names (`country=XX`) or the filters pick,
-/// else from all of them.
+/// Answer `path?raw` from the one Runtime the request names (`country=XX`) or the filters and
+/// `prefer` pick, else from all of them.
 async fn forward_or_merge(
     state: &RouteState,
     path: &str,
@@ -772,6 +831,8 @@ async fn forward_or_merge(
     let routed = match &decision {
         Decision::StreetTown(country) => Some((country, "filter-street-town")),
         Decision::Street(country) => Some((country, "filter-street")),
+        Decision::Prefer(country) => Some((country, "prefer")),
+        Decision::PreferFallback(country) => Some((country, "prefer-fallback")),
         Decision::Fanout => None,
     };
     if let Some((country, route)) = routed {
@@ -1223,6 +1284,7 @@ mod tests {
             streets: vec![street_hash(street).expect("street")],
             town: town.map(|town| town_hash(town).expect("town")),
             street_alone,
+            prefer: None,
         }
     }
 
@@ -1548,6 +1610,215 @@ mod tests {
         assert_eq!(route_of(&headers), (Some("filter-street"), Some("NZ")));
     }
 
+    /// `x-route` and `x-route-country` of a request to `base`, whatever its status: a fan-out of
+    /// several found addresses is a 400.
+    async fn routed(base: &str, query: &str) -> (String, Option<String>) {
+        let (_, headers, _) = get_full(&format!("{base}/{query}")).await;
+        let (route, country) = route_of(&headers);
+        (
+            route.expect("x-route").to_string(),
+            country.map(str::to_string),
+        )
+    }
+
+    /// Three countries that each find any address.
+    async fn finding_countries() -> Countries {
+        let hit = |label: &str| json!({ "label": label, "score": 1.0 });
+        countries([hit("au"), hit("nz"), hit("ca")]).await
+    }
+
+    fn is(route: &str, country: Option<&str>) -> (String, Option<String>) {
+        (route.to_string(), country.map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn a_street_and_town_held_by_one_country_beats_prefer() {
+        let c = finding_countries().await;
+
+        // An NZ supplier billing in AUD: prefer=AU is wrong, the town says Rotorua.
+        for path in [
+            "geocode?address=15+Eruera+Street&locality=Rotorua",
+            "search?q=15+Eruera+Street&locality=Rotorua",
+            "autocomplete?q=Eruera+Street&locality=Rotorua",
+        ] {
+            assert_eq!(
+                routed(&c.base, &format!("{path}&prefer=AU")).await,
+                is("filter-street-town", Some("NZ")),
+                "{path}"
+            );
+        }
+        // Held by all three, but only AU has it in Sydney.
+        assert_eq!(
+            routed(
+                &c.base,
+                "geocode?address=1+King+St&locality=Sydney&prefer=NZ"
+            )
+            .await,
+            is("filter-street-town", Some("AU"))
+        );
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (1, 3, 0));
+    }
+
+    #[tokio::test]
+    async fn prefer_keeps_a_street_held_by_several_countries() {
+        let c = finding_countries().await;
+
+        // Without prefer these three ask everyone.
+        for query in [
+            "geocode?address=1+King+St",
+            "geocode?address=1+King+Street&locality=Wellington",
+            "search?q=1+King+St",
+        ] {
+            assert_eq!(routed(&c.base, query).await.0, "fanout", "{query}");
+            assert_eq!(
+                routed(&c.base, &format!("{query}&prefer=NZ")).await,
+                is("prefer", Some("NZ")),
+                "{query}"
+            );
+        }
+        // The same street held by prefer and one other: prefer keeps it.
+        assert_eq!(
+            routed(&c.base, "geocode?address=1+George+St&prefer=AU").await,
+            is("prefer", Some("AU"))
+        );
+        assert_eq!(c.ca.hits(), 3, "only the fan-outs reached CA");
+    }
+
+    #[tokio::test]
+    async fn a_sole_street_holder_beats_a_prefer_that_does_not_hold_it() {
+        let c = finding_countries().await;
+
+        for query in [
+            "geocode?address=1+George+St&prefer=NZ",
+            // The town is in no Pack, so the street is all there is.
+            "geocode?address=1+George+St&locality=Nowhere&prefer=NZ",
+            "search?q=1+George+Street&prefer=CA",
+        ] {
+            assert_eq!(
+                routed(&c.base, query).await,
+                is("filter-street", Some("AU")),
+                "{query}"
+            );
+        }
+        assert_eq!((c.nz.hits(), c.ca.hits()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn prefer_is_asked_when_nothing_else_decides() {
+        let c = finding_countries().await;
+
+        for query in [
+            // Held nowhere.
+            "geocode?address=1+Unknown+Road&prefer=NZ",
+            // No street at all.
+            "geocode?address=Level+3&prefer=NZ",
+            // A name with no number or town may be a place, so its street alone does not
+            // route, but prefer is still asked.
+            "search?q=George+Street&prefer=NZ",
+            "autocomplete?q=George+Street&prefer=NZ",
+        ] {
+            assert_eq!(
+                routed(&c.base, query).await,
+                is("prefer-fallback", Some("NZ")),
+                "{query}"
+            );
+        }
+        // Typed so far, "King Street" is held by prefer: no locality needed.
+        assert_eq!(
+            routed(&c.base, "autocomplete?q=King+Street&prefer=NZ").await,
+            is("prefer", Some("NZ"))
+        );
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (0, 5, 0));
+    }
+
+    #[tokio::test]
+    async fn a_prefer_that_is_not_a_worker_is_ignored() {
+        let c = finding_countries().await;
+
+        for prefer in ["EU", "xx", "%20", ""] {
+            assert_eq!(
+                routed(
+                    &c.base,
+                    &format!("geocode?address=1+King+St&prefer={prefer}")
+                )
+                .await
+                .0,
+                "fanout",
+                "{prefer:?}"
+            );
+            assert_eq!(
+                routed(
+                    &c.base,
+                    &format!("geocode?address=1+George+St&prefer={prefer}")
+                )
+                .await,
+                is("filter-street", Some("AU")),
+                "{prefer:?}"
+            );
+        }
+        // Case does not matter for a worker.
+        assert_eq!(
+            routed(&c.base, "geocode?address=1+King+St&prefer=nz").await,
+            is("prefer", Some("NZ"))
+        );
+    }
+
+    #[tokio::test]
+    async fn country_beats_prefer() {
+        let c = finding_countries().await;
+
+        assert_eq!(
+            routed(&c.base, "search?q=1+George+St&country=CA&prefer=NZ").await,
+            is("country", Some("CA"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefer_without_a_filter_might_hold_the_street() {
+        let hit = json!({ "label": "1 George Street", "score": 1.0 });
+        let au = fake(
+            json!([]),
+            hit.clone(),
+            Some(filter_of(&[("George Street", &["Sydney"])])),
+            StatusCode::OK,
+        )
+        .await;
+        let nz = fake(json!([]), hit, None, StatusCode::OK).await;
+        let base = router(vec![("AU", au.url.clone()), ("NZ", nz.url.clone())]).await;
+
+        // NZ blocks a single winner, so without prefer this asks everyone (and AU, the only
+        // confirmed holder, wins the fan-out).
+        assert_eq!(
+            routed(&base, "geocode?address=1+George+St").await,
+            is("fanout", Some("AU"))
+        );
+        // NZ has no filter, so it might hold the street; the town cannot be unique either.
+        for query in [
+            "geocode?address=1+George+St&prefer=NZ",
+            "geocode?address=1+George+St&locality=Sydney&prefer=NZ",
+        ] {
+            assert_eq!(
+                routed(&base, query).await,
+                is("prefer", Some("NZ")),
+                "{query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefer_with_nothing_to_say_falls_back_to_every_runtime() {
+        let hit = json!({ "label": "1 King Street, Sydney", "score": 1.0 });
+        let c = countries([hit, Value::Null, Value::Null]).await;
+
+        let (status, headers, body) =
+            get_full(&format!("{}/geocode?address=1+King+St&prefer=NZ", c.base)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(route_of(&headers), (Some("fanout"), Some("AU")));
+        assert_eq!(body["result"]["country"], "AU");
+        // NZ was asked first as prefer, found nothing, and is asked again with the rest.
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (1, 2, 1));
+    }
+
     #[tokio::test]
     async fn a_runtime_without_a_usable_filter_might_hold_anything() {
         let street = filter_of(&[("Eruera Street", &["Rotorua"])]);
@@ -1678,6 +1949,7 @@ mod tests {
         assert_eq!(route_of(&headers), (Some("fanout"), Some("AU")));
         assert_eq!(body["result"]["label"], "found");
         // NZ was asked twice: as the routed Runtime, then again with the others.
+        // NZ was asked first as prefer, found nothing, and is asked again with the rest.
         assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (1, 2, 1));
 
         // Lists too: NZ answers an empty list, AU has results.

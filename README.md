@@ -140,12 +140,28 @@ Only a leading house number is read: an address written with the number after th
 3. Else every Runtime is asked, and `/search` and `/autocomplete` merge: labels that cover more of the query first (for autocomplete the last word counts as a prefix), then each Runtime's own ranking, interleaved, since BM25 scores of different Packs do not compare.
    `/geocode` answers the one non-null result; when several Runtimes answer, the score of one Pack against another's is not evidence (a street held by several countries makes each of them answer, and an address alone gives them no locality, region or postcode to check), so unless exactly one answering Runtime has a filter that holds the street, the router answers 400 `country_required`.
 
+**`prefer=XX`.**
+`/search`, `/autocomplete` and `/geocode` take an optional `prefer` for when `country` is absent (`country` wins over it).
+It is a soft hint, for example the country of an invoice's currency, and a currency can be wrong: an NZ supplier may bill in AUD, a Canadian one in USD.
+So it ranks below what the address itself says, and above everything that is only a guess.
+A `prefer` that is not a configured `--worker` (`EU`, a typo) is ignored, case aside, and routing is exactly as without it.
+With one that is:
+
+1. If exactly one country's filter holds the street with the town, the request goes there, even when it is not `prefer` (`x-route: filter-street-town`).
+   This needs a `locality`.
+2. Else if `prefer`'s filter holds the street, or `prefer` has no filter (it might hold anything), the request goes to `prefer` (`x-route: prefer`).
+3. Else if exactly one country's filter holds the street, it goes there (`x-route: filter-street`), under the same rule as above: not for a `/search` with neither a house number nor a `locality`, and not for `/autocomplete` without a `locality`.
+4. Else it goes to `prefer` anyway (`x-route: prefer-fallback`), including a request with no street at all, which would otherwise be asked of everyone.
+
+`x-route-country` names the country in every case.
+A routed Runtime that fails or finds nothing is followed by the fan-out, `prefer` included.
+
 A Runtime without a readable filter counts as holding anything, so it never lets another win alone, but it never wins alone either: a request is routed only when a filter confirms the country.
 A routed Runtime that fails, or answers with nothing, is followed by the fan-out, because a filter can be wrong (a false positive, a town spelled another way).
 A Runtime that sheds load (a 503 with `Retry-After`) is the exception: its answer goes back as it is, with the header, and nobody is asked again; when every Runtime sheds in a fan-out, the first one's 503 goes back.
 The route taken and the country are logged at debug level as `routed`.
 The street comes from the whole text, so a one-string address that includes the town or postcode ("15 Eruera Street, Rotorua 3010") finds no holder and is asked of everyone; send the town as `locality` to route it.
-Responses carry `x-route` (`filter-street-town`, `filter-street`, `fanout`, or `country` when `country=XX` was given) and, when one Runtime answered, `x-route-country`; routed and merged results carry a `country`.
+Responses carry `x-route` (`filter-street-town`, `filter-street`, `prefer`, `prefer-fallback`, `fanout`, or `country` when `country=XX` was given) and, when one Runtime answered, `x-route-country`; routed and merged results carry a `country`.
 The router's request id goes to every Runtime it calls as `x-request-id`, so one request has one id in both logs.
 
 The router fetches every filter at startup, then every `--filter-refresh-secs` (default 300, `0` turns the timer off), and again as soon as `/readyz` sees a Runtime that was not ready turn ready, so a swapped Pack is picked up without restarting the router.

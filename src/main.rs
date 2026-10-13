@@ -194,7 +194,9 @@ enum Commands {
     /// country whose Pack holds the request's street (each Runtime serves a membership filter at
     /// /routing-filter) and, when that is not decided, asks every Runtime: /search and
     /// /autocomplete results are merged (labels that cover more of the query first, then each
-    /// Runtime's own ranking, interleaved), /geocode keeps the one found address.
+    /// Runtime's own ranking, interleaved), /geocode keeps the one found address. A `prefer=XX`
+    /// hint (not a fact, unlike `country`) is tried after a unique street and town match and
+    /// before everything else.
     Route {
         /// A Runtime as COUNTRY=URL, e.g. NZ=http://127.0.0.1:8081. Repeat per country.
         #[arg(long = "worker", required = true)]
