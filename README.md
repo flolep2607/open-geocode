@@ -67,9 +67,9 @@ cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-
   Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
   Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
 - The routing filter (see [Routing packs by country](#routing-packs-by-country)) gathers one 64-bit hash per street key in a sorter that takes an eighth of a sorter's share, so it spills like the others, and is deduplicated and built one shard of at most about 4 million keys at a time.
-  The shard's `Vec<u64>` (32 MB) is reserved from the pool; xorf's construction scratch for it (a few times that, about 150 MB transient, the same whatever the input size) and the table of place names it needs to add towns (16 bytes per place or boundary record that a record's context can point at, held until the Pack is sealed) are outside the pool, like the boundary polygons.
+  The shard's `Vec<u64>` (32 MB) is reserved from the pool; xorf's construction scratch for it (a few times that, about 150 MB transient, the same whatever the input size) and the table of place names it needs to add towns (16 bytes per place or boundary record that a record's context can point at, plus 16 for each district whose name loses administrative words, held until the Pack is sealed) are outside the pool, like the boundary polygons.
   A spilled key takes about 11 bytes of scratch (a varint of 9 to 10 bytes for a random 64-bit hash, plus a length prefix), and the sorter drops only repeats that its small cache sees, so scratch grows with the keys pushed, not the unique ones.
-  Only a New Zealand extract has been built so far (277,490 keys pushed for 264,812 unique, a 307 KB section, nothing spilled), so the planet figures are estimates: about 100 to 150 million unique keys, a 115 to 170 MB section and about 1.5 GB of scratch for 140 million keys pushed.
+  Only a New Zealand extract has been built so far (333,356 keys pushed for 318,828 unique, a 369 KB section, nothing spilled), so the planet figures are estimates: about 120 to 180 million unique keys, a 140 to 210 MB section and about 1.8 GB of scratch for 170 million keys pushed.
   The build report records the measured keys pushed (`scratch.sorters.routing_keys`), the unique keys (`output.routing_filter_keys`) and the section size, which is how to check the estimate on a large extract.
 - The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
   Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
@@ -116,11 +116,15 @@ Requests without one are routed by street, not by comparing the raw scores of di
 **The `routing/filter` section.**
 The builder writes it into every Pack: a binary fuse filter over hashes of `street` and `street|town` for every address, interpolation and street record.
 Towns are the record's own locality and the district, locality, neighbourhood and place boundaries around it.
+A district is also a town without its generic administrative words (District, City, Council, Shire, Region, Regional, Rural, Municipality, and a leading "City of", "Shire of", "Town of", "Regional Municipality of" and the like): an invoice writes "Hastings" for New Zealand's "Hastings District" and "Sydney" for Australia's "City of Sydney".
+This adds about 20% keys to a New Zealand build.
+Every street in a district then confirms that town, so a very common street with a district's name ("Main Road, Marlborough") confirms New Zealand if the Pack of the intended country does not hold that street and town; how often that costs a right answer has not been measured on a gold set against Packs of several countries.
 Keys use the same normalization as the text index, so a query's street hashes like a stored one.
 It costs about 1.2 bytes per key and has about 0.4% false positives and no false negatives.
 A Pack with no street at all gets an empty filter, which says it holds nothing; a Pack without the section was built before it existed, and the router treats it as holding anything.
 The header carries a key scheme number, bumped whenever the normalization, the abbreviation rules or the hashes change, and a reader refuses a filter of another scheme, so a router built with other rules treats that Runtime as holding anything instead of misrouting.
 Scheme 2 is the one with accent folding and the French and German abbreviations: a router of this build ignores the filter an older Runtime serves from a scheme 1 Pack (that Runtime counts as holding anything) until the Runtime is upgraded and its Pack rebuilt.
+Scheme 3 adds the districts' names without their administrative words: a router of this build ignores a scheme 2 Pack's filter until that Pack is rebuilt, and an older router ignores a scheme 3 Pack's, so no mix of builds lets a new Pack be the only one to confirm a town.
 It is a section of its own version: Packs without it still open, and older binaries ignore it (the container lists unknown sections and checksums them like the others).
 
 **`GET /routing-filter`.**

@@ -11,7 +11,8 @@
 //!
 //! - `street`: the street of an address, interpolation or street record;
 //! - `street|town`: that street with each town the record names, from its own locality and from
-//!   the district, locality, neighbourhood and place boundaries that contain it.
+//!   the district, locality, neighbourhood and place boundaries that contain it. A district is also
+//!   a town without its administrative words ("Rotorua District" is also "Rotorua").
 //!
 //! The section is an 8-bit binary fuse filter (about 1.2 bytes per key, about 0.4% false
 //! positives). It never has false negatives, so a Pack that holds a street always says so.
@@ -64,7 +65,12 @@ pub(crate) const ROUTING_FILTER_VERSION: u32 = 1;
 /// 1: the first normalization (lower case only) and English abbreviations.
 /// 2: accent folding and transliteration in `normalize_index_text`, French and German street
 ///    abbreviations in `expand_address_abbreviations`.
-pub(crate) const KEY_SCHEME: u16 = 2;
+/// 3: a district also gives its name without its administrative words ("Rotorua District" is also
+///    "Rotorua"). Only keys were added, so an older Pack would still answer what it always did, but
+///    in a fleet with both, a new Pack could be the only one to confirm a street and town that an
+///    old Pack of the right country cannot, and the wrong country would win. A router of another
+///    scheme counts the Pack as holding anything instead.
+pub(crate) const KEY_SCHEME: u16 = 3;
 
 /// Fixed forever and stored in the header, so a reader can refuse a filter hashed another way.
 pub(crate) const ROUTING_SEED: u64 = 0x6f67_726f_7574_6531;
@@ -99,6 +105,56 @@ pub(crate) fn street_hash(street: &str) -> Option<u64> {
 pub(crate) fn town_hash(town: &str) -> Option<u64> {
     let normalized = normalize_index_text(town)?;
     Some(xxh3_64_with_seed(normalized.as_bytes(), ROUTING_SEED))
+}
+
+/// Words an administrative name carries that a person writing an address leaves out: NZ's
+/// "Rotorua District" and "Hamilton City", AU's "City of Sydney" and "District Council of Mount
+/// Barker", Canada's "Regional Municipality of Peel". Lower case, as `normalize_index_text` gives
+/// them.
+const ADMIN_WORDS: [&str; 8] = [
+    "district",
+    "city",
+    "council",
+    "shire",
+    "region",
+    "regional",
+    "rural",
+    "municipality",
+];
+
+/// A district's name without its generic administrative words, hashed as a town; `None` when
+/// nothing is stripped. Leading words count only before an "of" ("City of Sydney", "Regional
+/// District of Central Okanagan", "Municipality of the District of Lunenburg"), trailing ones
+/// alone ("Hamilton City Council" loses both), and a name that is nothing but such words is kept
+/// whole.
+fn district_town_hash(name: &str) -> Option<u64> {
+    let normalized = normalize_index_text(name)?;
+    let mut tokens: Vec<&str> = normalized.split_whitespace().collect();
+    let whole = tokens.len();
+    loop {
+        let before = tokens.len();
+        if let Some(of) = tokens.iter().position(|word| *word == "of")
+            && of > 0
+            && of + 1 < tokens.len()
+            && tokens[..of]
+                .iter()
+                .all(|word| *word == "town" || ADMIN_WORDS.contains(word))
+        {
+            tokens.drain(..=of);
+            if tokens.len() > 1 && tokens[0] == "the" {
+                tokens.remove(0);
+            }
+        }
+        if tokens.len() > 1 && tokens.last().is_some_and(|word| ADMIN_WORDS.contains(word)) {
+            tokens.pop();
+        }
+        if tokens.len() == before {
+            break;
+        }
+    }
+    let kept = tokens.iter().any(|word| !ADMIN_WORDS.contains(word));
+    (kept && tokens.len() != whole)
+        .then(|| xxh3_64_with_seed(tokens.join(" ").as_bytes(), ROUTING_SEED))
 }
 
 /// The `street|town` key. A hash of hashes, so the build never keeps town strings.
@@ -142,12 +198,17 @@ pub(crate) fn query_street_hashes(text: &str) -> Vec<u64> {
 
 /// Names of the boundary places a context tuple points at, by record id. The tuple holds ids, not
 /// names, and the build only has the records it is writing, so the town hash of each place is
-/// kept as it goes by. Context records are written before the records they contain (ids only
-/// grow), so the table stays sorted. A place written in the same batch as the addresses that use
-/// it is not known yet and gives those records fewer town keys, never a wrong one.
+/// kept as it goes by. A district also keeps the hash of its name without the administrative
+/// words, which is the town an invoice writes ("Hastings" for "Hastings District"). Context
+/// records are written before the records they contain (ids only grow), so the tables stay
+/// sorted. A place written in the same batch as the addresses that use it is not known yet and
+/// gives those records fewer town keys, never a wrong one.
 #[derive(Debug, Default)]
 pub(crate) struct PlaceTowns {
     towns: Vec<(RecordId, u64)>,
+    /// The stripped names of the districts that have one. Apart from `towns` so that the many
+    /// other places keep 16 bytes each.
+    stripped: Vec<(RecordId, u64)>,
 }
 
 impl PlaceTowns {
@@ -161,14 +222,24 @@ impl PlaceTowns {
         }
         if let Some(hash) = town_hash(name) {
             self.towns.push((id, hash));
+            if layer == PlaceLayer::District
+                && let Some(stripped) = district_town_hash(name)
+            {
+                self.stripped.push((id, stripped));
+            }
         }
     }
 
-    fn get(&self, id: RecordId) -> Option<u64> {
-        self.towns
-            .binary_search_by_key(&id, |(place, _)| *place)
-            .ok()
-            .map(|index| self.towns[index].1)
+    /// Adds the town hashes of place `id` to `out`.
+    fn extend_towns(&self, id: RecordId, out: &mut Vec<u64>) {
+        let find = |table: &[(RecordId, u64)]| {
+            table
+                .binary_search_by_key(&id, |(place, _)| *place)
+                .ok()
+                .map(|index| table[index].1)
+        };
+        out.extend(find(&self.towns));
+        out.extend(find(&self.stripped));
     }
 }
 
@@ -204,7 +275,7 @@ pub(crate) fn record_keys(
         return Vec::new();
     };
 
-    let mut towns = Vec::with_capacity(5);
+    let mut towns = Vec::with_capacity(8);
     towns.extend(own_locality.and_then(town_hash));
     if let Some(context) = context {
         // The layers `hit_matches_address_context` accepts as a locality.
@@ -218,7 +289,7 @@ pub(crate) fn record_keys(
         .into_iter()
         .flatten()
         {
-            towns.extend(places.get(id));
+            places.extend_towns(id, &mut towns);
         }
     }
     towns.sort_unstable();
@@ -691,7 +762,7 @@ mod tests {
     #[test]
     fn key_scheme_is_pinned() {
         let street = |text: &str| street_hash(text).expect("street");
-        assert_eq!(KEY_SCHEME, 2);
+        assert_eq!(KEY_SCHEME, 3);
         assert_eq!(street("King Street"), 8_499_246_586_564_395_725);
         assert_eq!(street("King St"), street("king street"));
         assert_eq!(street("St Kilda Rd"), 15_419_769_240_993_744_527);
@@ -722,7 +793,7 @@ mod tests {
             .collect();
         let bytes = encode(&keys, 0);
         assert_eq!(bytes.len(), 252);
-        assert_eq!(xxh3_64_with_seed(&bytes, 0), 10_753_183_529_993_147_864);
+        assert_eq!(xxh3_64_with_seed(&bytes, 0), 14_260_658_962_711_161_593);
     }
 
     #[test]
@@ -936,6 +1007,98 @@ mod tests {
 
         // Without context only the own locality is known; a place record gives nothing.
         assert_eq!(record_keys(&record, None, &places).len(), 2);
+    }
+
+    #[test]
+    fn district_names_lose_their_administrative_words() {
+        let stripped = |name: &str| district_town_hash(name);
+        let hash = |town: &str| town_hash(town);
+        for (name, town) in [
+            ("Rotorua District", "Rotorua"),
+            ("Hamilton City", "Hamilton"),
+            ("christchurch CITY", "Christchurch"),
+            ("City of Sydney", "Sydney"),
+            ("Shire of Augusta-Margaret River", "Augusta-Margaret River"),
+            ("Town of Cambridge", "Cambridge"),
+            ("Municipality of Kiama", "Kiama"),
+            ("Hamilton City Council", "Hamilton"),
+            ("Region of Waterloo", "Waterloo"),
+            ("District of Muskoka", "Muskoka"),
+            ("City of Sydney Council", "Sydney"),
+            ("District Council of Mount Barker", "Mount Barker"),
+            ("Rural City of Murray Bridge", "Murray Bridge"),
+            ("Regional Municipality of Peel", "Peel"),
+            ("Regional District of Central Okanagan", "Central Okanagan"),
+            ("Municipality of the District of Lunenburg", "Lunenburg"),
+            ("Council of the City of Sydney", "Sydney"),
+            ("Bay of Plenty Region", "Bay of Plenty"),
+        ] {
+            assert_eq!(stripped(name), hash(town), "{name}");
+        }
+        // Nothing to strip, or nothing would remain: the name stays as it is.
+        for name in [
+            "Rotorua",
+            "City",
+            "City of",
+            "Cityscape",
+            "City of Region",
+            "Regional Council",
+        ] {
+            assert_eq!(stripped(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_district_is_a_town_and_so_is_its_stripped_name() {
+        use crate::{
+            context::AdminContextTuple,
+            record::{
+                AddressComponents, AddressRecord, LocationPrecision, OsmObjectType,
+                SourceProvenance, point_geometry,
+            },
+        };
+
+        // An address with a suburb and no town, inside "Rotorua District".
+        let record = Record::Address(AddressRecord {
+            address: AddressComponents {
+                number: "15".into(),
+                street: Some("Eruera Street".into()),
+                place: None,
+                unit: None,
+                locality: Some("Glenholme".into()),
+                region: None,
+                postcode: None,
+                country: None,
+            },
+            geometry: point_geometry(176.2, -38.1),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(OsmObjectType::Node, 1),
+        });
+        let mut places = PlaceTowns::default();
+        places.note(2, PlaceLayer::District, "Rotorua District");
+        places.note(3, PlaceLayer::Locality, "Hamilton City");
+        let context = RecordContext {
+            admin_context: AdminContextTuple {
+                district_record_id: Some(2),
+                locality_record_id: Some(3),
+                ..AdminContextTuple::default()
+            },
+            flags: 0,
+        };
+
+        let street = street_hash("Eruera Street").unwrap();
+        let mut expected = vec![
+            street,
+            pair_hash(street, town_hash("Glenholme").unwrap()),
+            pair_hash(street, town_hash("Rotorua District").unwrap()),
+            pair_hash(street, town_hash("Rotorua").unwrap()),
+            // Only districts are stripped.
+            pair_hash(street, town_hash("Hamilton City").unwrap()),
+        ];
+        let mut keys = record_keys(&record, Some(&context), &places);
+        keys.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
     }
 
     #[test]
