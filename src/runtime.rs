@@ -10,9 +10,12 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
+    body::Body,
     extract::{Query, State},
     handler::{Handler, HandlerWithoutStateExt},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
+    response::{IntoResponse, Response},
     routing::{MethodFilter, MethodRouter, on},
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,7 @@ use tokio::{net::TcpListener, task};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
+    container::Bytes,
     http::{
         bounds, health, method,
         problem::{Problem, classify_search_error},
@@ -28,6 +32,7 @@ use crate::{
     pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
     record::OsmObjectType,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
+    routing::{ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION},
     search::{
         AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchHit,
         TextSearchOptions,
@@ -46,17 +51,46 @@ pub struct ServeOptions {
 pub(crate) struct AppState {
     searcher: Arc<PackTextSearcher>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
+    /// The Pack's routing filter, when it has one, for `/routing-filter`.
+    routing_filter: Option<Arc<RoutingFilterSection>>,
     ready: Arc<AtomicBool>,
+}
+
+/// The `routing/filter` section as the Pack holds it. `bytes` is a slice of the mapped file, so
+/// serving it copies nothing.
+struct RoutingFilterSection {
+    bytes: Bytes,
+    /// The section's own checksum, so an unchanged filter costs the router a 304.
+    etag: String,
 }
 
 impl AppState {
     fn open(path: &Path) -> Result<Self> {
         let pack = Arc::new(PackReader::open(path)?);
+        // A filter this build cannot read (a newer format) only costs the router its
+        // street-based routing for this Runtime; it must not stop the Pack serving.
+        let routing_filter = match pack
+            .container()
+            .optional_section(ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION)
+        {
+            Ok(bytes) => bytes.map(|bytes| {
+                let checksum = pack.container().sections()[ROUTING_FILTER_SECTION].checksum;
+                Arc::new(RoutingFilterSection {
+                    bytes,
+                    etag: format!("\"{checksum:016x}\""),
+                })
+            }),
+            Err(error) => {
+                eprintln!("not serving a routing filter: {error:#}");
+                None
+            }
+        };
         let searcher = PackTextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(pack)?;
         Ok(Self {
             searcher: Arc::new(searcher),
             reverse_geocoder: Arc::new(reverse_geocoder),
+            routing_filter,
             ready: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -190,6 +224,7 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", get_only(geocode))
         .route("/reverse", get_only(reverse))
+        .route("/routing-filter", get_only(routing_filter))
         .route("/healthz", get_only(health::healthz))
         .route("/readyz", get_only(health::readyz));
 
@@ -423,6 +458,50 @@ async fn reverse(
     .map_err(|error| internal(error, &request_id))?;
 
     Ok(Json(response))
+}
+
+/// `/routing-filter`: the Pack's street membership filter, for `open-geocode route` to decide which
+/// Runtime holds a street (see [`crate::routing`]). The format, version and hash seed are in the
+/// section's own header. The ETag is the section checksum, so a router refreshing every few
+/// minutes pays for a 304 until the Pack is swapped.
+async fn routing_filter(
+    State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = request_id.map(|Extension(RequestId(id))| id);
+    let Some(section) = state.routing_filter else {
+        return with_id(
+            Problem::not_found().with_detail("this Pack has no routing filter"),
+            &request_id,
+        )
+        .into_response();
+    };
+    let etag = HeaderValue::from_str(&section.etag).expect("a hex etag is a header value");
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|tags| {
+            tags.split(',')
+                .any(|tag| tag.trim().trim_start_matches("W/") == section.etag)
+        });
+    let mut response = if unchanged {
+        (StatusCode::NOT_MODIFIED, Body::empty()).into_response()
+    } else {
+        let mut response = Response::new(Body::from(hyper::body::Bytes::from_owner(
+            section.bytes.clone(),
+        )));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        response
+    };
+    response.headers_mut().insert(header::ETAG, etag);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 impl SearchApiResult {
@@ -830,6 +909,108 @@ mod router_tests {
         let reply = send(router, tagged).await;
         assert_eq!(reply.request_id().as_deref(), Some("ray-abc-123"));
         assert_eq!(reply.json()["request_id"], "ray-abc-123");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn routing_filter_is_served_with_an_etag_and_only_by_get() {
+        use crate::routing::{RoutingFilter, pair_hash, street_hash, town_hash};
+
+        let pack = temp_path("routing-filter");
+        write_pack(&pack);
+        let demo = temp_path("routing-filter-demo");
+        let no_basemap = temp_path("routing-filter-no-basemap");
+        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+
+        let reply = send(router.clone(), request("GET", "/routing-filter")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.content_type(), "application/octet-stream");
+        let etag = reply
+            .headers
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("etag")
+            .to_string();
+        // "king street" and king street|toronto are in this Pack's one address.
+        let filter = RoutingFilter::parse(reply.body.as_slice()).expect("the body is the section");
+        let street = street_hash("King Street").expect("street");
+        assert!(filter.maybe_contains(street));
+        assert!(filter.maybe_contains(pair_hash(street, town_hash("Toronto").expect("town"))));
+        assert!(!filter.maybe_contains(street_hash("Queen Street").expect("street")));
+        assert_eq!(filter.key_count(), 2);
+
+        // The same section served again, revalidated by its ETag, is a 304 with no body.
+        let mut conditional = request("GET", "/routing-filter");
+        conditional
+            .headers_mut()
+            .insert(header::IF_NONE_MATCH, etag.parse().expect("header value"));
+        let reply = send(router.clone(), conditional).await;
+        assert_eq!(reply.status, StatusCode::NOT_MODIFIED);
+        assert!(reply.body.is_empty());
+        let mut stale = request("GET", "/routing-filter");
+        stale.headers_mut().insert(
+            header::IF_NONE_MATCH,
+            "\"0000000000000000\"".parse().expect("header value"),
+        );
+        assert_eq!(send(router.clone(), stale).await.status, StatusCode::OK);
+
+        // GET only, like the rest of the API.
+        let reply = send(router.clone(), request("HEAD", "/routing-filter")).await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            reply
+                .headers
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("GET")
+        );
+        let reply = send(router, request("POST", "/routing-filter")).await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn a_pack_without_a_routing_filter_answers_a_404_problem() {
+        use crate::record::{PlaceLayer, PlaceRecord, Record};
+
+        let pack = temp_path("no-routing-filter");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = PackWriter::create(&pack).expect("writer");
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Locality,
+                    PlaceRecord {
+                        name: "Rotorua".to_string(),
+                        place_type: "city".to_string(),
+                        geometry: crate::record::point_geometry(176.25, -38.14),
+                        source: SourceProvenance::osm(OsmObjectType::Relation, 7),
+                    },
+                ),
+                None,
+            )
+            .expect("place");
+        writer.finish().expect("finish");
+        let demo = temp_path("no-routing-filter-demo");
+        let no_basemap = temp_path("no-routing-filter-no-basemap");
+        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+
+        let mut tagged = request("GET", "/routing-filter");
+        tagged
+            .headers_mut()
+            .insert("cf-ray", header::HeaderValue::from_static("ray-filter-1"));
+        let reply = send(router, tagged).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "not_found");
+        assert_eq!(reply.json()["request_id"], "ray-filter-1");
+        assert!(
+            reply.json()["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("routing filter"))
+        );
 
         let _ = std::fs::remove_dir_all(&pack);
     }
