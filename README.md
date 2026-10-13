@@ -63,8 +63,10 @@ cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-
   Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
   Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
 - The routing filter (see [Routing packs by country](#routing-packs-by-country)) gathers one 64-bit hash per street key in a sorter that takes an eighth of a sorter's share, so it spills like the others, and is deduplicated and built one shard of at most about 4 million keys at a time.
-  The shard's `Vec<u64>` (32 MB) is reserved from the pool; xorf's construction scratch for it (a few times that, about 150 MB transient, the same whatever the input size) and the table of admin place names it needs to add towns (16 bytes per admin place) are outside the pool, like the boundary polygons.
-  The planet figures are estimates, about 100 to 150 million unique keys and a 115 to 170 MB section; the build report records the measured keys pushed (`scratch.sorters.routing_keys`), the unique keys (`output.routing_filter_keys`) and the section size.
+  The shard's `Vec<u64>` (32 MB) is reserved from the pool; xorf's construction scratch for it (a few times that, about 150 MB transient, the same whatever the input size) and the table of place names it needs to add towns (16 bytes per place or boundary record that a record's context can point at, held until the Pack is sealed) are outside the pool, like the boundary polygons.
+  A spilled key takes about 11 bytes of scratch (a varint of 9 to 10 bytes for a random 64-bit hash, plus a length prefix), and the sorter drops only repeats that its small cache sees, so scratch grows with the keys pushed, not the unique ones.
+  Only a New Zealand extract has been built so far (277,490 keys pushed for 264,812 unique, a 307 KB section, nothing spilled), so the planet figures are estimates: about 100 to 150 million unique keys, a 115 to 170 MB section and about 1.5 GB of scratch for 140 million keys pushed.
+  The build report records the measured keys pushed (`scratch.sorters.routing_keys`), the unique keys (`output.routing_filter_keys`) and the section size, which is how to check the estimate on a large extract.
 - The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
   Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
 - Admin boundary polygons and postcode centroids grow with the number of boundaries and postcodes, not with the number of addresses.
@@ -105,30 +107,37 @@ Requests with `country=XX` go to that country's Runtime; `/reverse` always needs
 Requests without one are routed by street, not by comparing the raw scores of different Packs.
 
 **The `routing/filter` section.**
-The builder writes it into every Pack that has a street: a binary fuse filter over hashes of `street` and `street|town` for every address, interpolation and street record.
+The builder writes it into every Pack: a binary fuse filter over hashes of `street` and `street|town` for every address, interpolation and street record.
 Towns are the record's own locality and the district, locality, neighbourhood and place boundaries around it.
 Keys use the same normalization as the text index, so a query's street hashes like a stored one.
 It costs about 1.2 bytes per key and has about 0.4% false positives and no false negatives.
-It is a section of its own version: Packs without it still open, and older binaries ignore it.
+A Pack with no street at all gets an empty filter, which says it holds nothing; a Pack without the section was built before it existed, and the router treats it as holding anything.
+The header carries a key scheme number, bumped whenever the normalization, the abbreviation rules or the hashes change, and a reader refuses a filter of another scheme, so a router built with other rules treats that Runtime as holding anything instead of misrouting.
+It is a section of its own version: Packs without it still open, and older binaries ignore it (the container lists unknown sections and checksums them like the others).
 
 **`GET /routing-filter`.**
 The Runtime serves the section's bytes as `application/octet-stream`, straight from the mapped file, with the section checksum as `ETag` (`If-None-Match` gets a 304).
 The format, version and hash seed are in the section's header.
 A Pack without a filter answers a 404 Problem.
 GET only, like the rest of the API.
+The endpoint is for the router, on the internal network: the body is megabytes (an estimated 115 to 170 MB for a planet Pack) and is not rate limited, so a public deployment should deny `/routing-filter` at its proxy.
 
 **Router behaviour.**
 For `/geocode` the street is `address` without its house number and unit and the town is `locality`; for `/search` and `/autocomplete` the street comes from `q` and `locality` is an optional hint that the Runtimes ignore.
+Text before the number is read two ways (a unit like "Level 3", or part of a name like "Highway 6 North") and both are tried.
 
 1. If exactly one country's filter holds the street with the town, the request goes there.
-2. Else if exactly one holds the street, it goes there.
-3. Else every Runtime is asked: `/search` and `/autocomplete` merge by score, and `/geocode` answers the one non-null result (several: a Runtime whose filter holds the street first, then the highest score).
+2. Else if exactly one holds the street, it goes there. This step is for `/geocode`, and for `/search` with a house number or a `locality`: a name with no number may be a place, and `/autocomplete` text may be half a street, so `/autocomplete` routes only with a `locality`.
+3. Else every Runtime is asked, and `/search` and `/autocomplete` merge by score.
+   `/geocode` answers the one non-null result; when several Runtimes answer, the score of one Pack against another's is not evidence (a street held by several countries makes each of them answer, and an address alone gives them no locality, region or postcode to check), so unless exactly one answering Runtime has a filter that holds the street, the router answers 400 `country_required`.
 
-A Runtime without a readable filter counts as holding anything, so it never lets another win alone.
-A routed Runtime that fails is replaced by the fan-out.
+A Runtime without a readable filter counts as holding anything, so it never lets another win alone, but it never wins alone either: a request is routed only when a filter confirms the country.
+A routed Runtime that fails, or answers with nothing, is followed by the fan-out, because a filter can be wrong (a false positive, a town spelled another way).
+The street comes from the whole text, so a one-string address that includes the town or postcode ("15 Eruera Street, Rotorua 3010") finds no holder and is asked of everyone; send the town as `locality` to route it.
 Responses carry `x-route` (`filter-street-town`, `filter-street`, `fanout`, or `country` when `country=XX` was given) and, when one Runtime answered, `x-route-country`; routed and merged results carry a `country`.
 
-The router fetches every filter at startup, then every `--filter-refresh-secs` (default 300, `0` turns the timer off), and again as soon as `/readyz` finds a Runtime that was not ready is ready, so a swapped Pack is picked up without restarting the router.
+The router fetches every filter at startup, then every `--filter-refresh-secs` (default 300, `0` turns the timer off), and again as soon as `/readyz` sees a Runtime that was not ready turn ready, so a swapped Pack is picked up without restarting the router.
+The first fetch runs in the background, so the router listens at once, and a Runtime that has no filter yet (still starting, or an old Pack) is asked again every 15 seconds.
 An unchanged filter costs a 304.
 
 ## Hosted demo
