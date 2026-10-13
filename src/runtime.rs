@@ -582,14 +582,10 @@ async fn geocode_batch(
                 let _permit = permit;
                 chunk
                     .into_iter()
-                    .map(|lookup| match lookup {
-                        Ok(options) => match geocode_one(&searcher, options) {
-                            Ok(answer) => BatchItem::Answer(Box::new(answer)),
-                            Err(error) => BatchItem::Failed {
-                                problem: search_error(error, &request_id),
-                            },
-                        },
-                        Err(problem) => BatchItem::Failed { problem },
+                    .map(|lookup| {
+                        answer_item(lookup, &request_id, |options| {
+                            geocode_one(&searcher, options)
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -601,7 +597,17 @@ async fn geocode_batch(
     for (len, handle) in chunks {
         match handle {
             Some(handle) => {
-                results.extend(handle.await.map_err(|error| internal(error, &request_id))?)
+                match handle.await {
+                    Ok(answers) => results.extend(answers),
+                    // The chunk's task itself was lost: its items are answered as failed and the
+                    // rest of the page is kept.
+                    Err(error) => {
+                        let problem = internal(error, &request_id);
+                        results.extend((0..len).map(|_| BatchItem::Failed {
+                            problem: problem.clone(),
+                        }));
+                    }
+                }
             }
             None => results.extend((0..len).map(|_| BatchItem::Failed {
                 problem: with_id(Problem::overloaded(), &request_id),
@@ -626,6 +632,29 @@ async fn geocode_batch(
         "geocode batch"
     );
     Ok(Json(BatchResponse { results }))
+}
+
+/// One item of a batch: its lookup run by `geocode`, or the Problem that stands for it. A panic
+/// in the lookup is that item's internal Problem. Left to unwind it would fail the chunk's task,
+/// and with it the whole page, discarding the items that were answered.
+fn answer_item(
+    lookup: Result<AddressGeocodeOptions, Problem>,
+    request_id: &Option<String>,
+    geocode: impl FnOnce(AddressGeocodeOptions) -> anyhow::Result<GeocodeResponse>,
+) -> BatchItem {
+    let options = match lookup {
+        Ok(options) => options,
+        Err(problem) => return BatchItem::Failed { problem },
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| geocode(options))) {
+        Ok(Ok(answer)) => BatchItem::Answer(Box::new(answer)),
+        Ok(Err(error)) => BatchItem::Failed {
+            problem: search_error(error, request_id),
+        },
+        Err(_) => BatchItem::Failed {
+            problem: internal("a geocode lookup panicked", request_id),
+        },
+    }
 }
 
 async fn autocomplete(
@@ -1180,6 +1209,41 @@ mod router_tests {
         assert_eq!(reply.json()["results"][0]["result"]["layer"], "address");
 
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_panicking_lookup_fails_its_item_and_no_other() {
+        let lookup = |address: &str| {
+            Ok(AddressGeocodeOptions {
+                address: address.to_string(),
+                locality: None,
+                region: None,
+                postcode: None,
+                limit: 0,
+                layer: None,
+                street_fallback: false,
+            })
+        };
+        let id = Some("ray-panic".to_string());
+        let geocode = |options: AddressGeocodeOptions| {
+            if options.address == "boom" {
+                panic!("a search bug");
+            }
+            Ok(GeocodeResponse {
+                query: options.address,
+                result: None,
+            })
+        };
+        let items: Vec<_> = ["a", "boom", "b"]
+            .into_iter()
+            .map(|address| answer_item(lookup(address), &id, geocode))
+            .collect();
+        let json = serde_json::to_value(&items).unwrap();
+        assert_eq!(json[0]["query"], "a");
+        assert_eq!(json[1]["problem"]["error_code"], "internal_error");
+        assert_eq!(json[1]["problem"]["status"], 500);
+        assert_eq!(json[1]["problem"]["request_id"], "ray-panic");
+        assert_eq!(json[2]["query"], "b");
     }
 
     #[tokio::test]
