@@ -21,8 +21,8 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
-/// Most items one `POST /geocode/batch` may carry. The router splits nothing: it accepts the same
-/// number, so a Runtime's sub-batch is never larger than this.
+/// Most items one `POST /geocode/batch` may carry. The router accepts the same number, so the
+/// sub-batch it sends a Runtime (each item at most once) is never larger than this.
 pub(crate) const MAX_BATCH_ITEMS: usize = 1000;
 
 /// Largest `POST /geocode/batch` body. An item is at most four 256-character strings plus a few
