@@ -24,6 +24,14 @@ pub(crate) async fn method_not_allowed(request_id: Option<Extension<RequestId>>)
     attach_id(Problem::method_not_allowed("GET"), request_id)
 }
 
+/// The 405 of a POST-only route (`POST /geocode/batch`), which the global fallback would
+/// otherwise answer with `Allow: GET`.
+pub(crate) async fn post_only_method_not_allowed(
+    request_id: Option<Extension<RequestId>>,
+) -> Response {
+    attach_id(Problem::method_not_allowed("POST"), request_id)
+}
+
 fn attach_id(problem: Problem, request_id: Option<Extension<RequestId>>) -> Response {
     match request_id {
         Some(Extension(RequestId(id))) => problem.with_request_id(id),

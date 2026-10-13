@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State, rejection::BytesRejection},
     handler::{Handler, HandlerWithoutStateExt},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
@@ -58,6 +58,12 @@ pub struct ServeOptions {
 
 /// How long an API request waits for a blocking-pool slot before it is shed with 503.
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Items of a `/geocode/batch` that share one blocking-pool slot. Small, so that a batch takes its
+/// slots one chunk at a time and requests that arrive meanwhile queue behind a chunk (a few
+/// milliseconds) rather than behind the batch; large enough that the slot and the task cost
+/// nothing next to the searches.
+const BATCH_CHUNK: usize = 16;
 
 /// The default for `serve --max-concurrency`: one request per core.
 pub fn default_max_concurrency() -> NonZeroUsize {
@@ -151,6 +157,35 @@ struct GeocodeParams {
     street_fallback: bool,
 }
 
+impl GeocodeParams {
+    /// The lookup these parameters ask for, or why they cannot be one. The one place that
+    /// validates `/geocode`, shared by the GET route and every item of `/geocode/batch` so the
+    /// two cannot drift.
+    fn into_options(self) -> Result<AddressGeocodeOptions, Problem> {
+        let address = bounds::validate_query_length(self.address.as_deref().unwrap_or_default())?;
+        if address.is_empty() {
+            return Err(Problem::invalid_query("address must not be empty"));
+        }
+        let context = |value: Option<String>| -> Result<Option<String>, Problem> {
+            let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())?;
+            Ok(Some(value).filter(|value| !value.is_empty()))
+        };
+        let locality = context(self.locality)?;
+        let region = context(self.region)?;
+        let postcode = context(self.postcode)?;
+        bounds::validate_search_limit(self.limit)?;
+        Ok(AddressGeocodeOptions {
+            address,
+            locality,
+            region,
+            postcode,
+            limit: self.limit,
+            layer: self.layer,
+            street_fallback: self.street_fallback,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ReverseParams {
     lon: f64,
@@ -169,6 +204,20 @@ pub struct SearchResponse {
 pub struct GeocodeResponse {
     pub query: String,
     pub result: Option<SearchApiResult>,
+}
+
+/// One item of a `/geocode/batch` answer, in the position of the item it answers: what `GET
+/// /geocode` would have answered, or the Problem it would have answered instead.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum BatchItem {
+    Answer(Box<GeocodeResponse>),
+    Failed { problem: Problem },
+}
+
+#[derive(Debug, Serialize)]
+struct BatchResponse {
+    results: Vec<BatchItem>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -263,6 +312,10 @@ pub(crate) fn build_router(state: AppState, demo: &Path, basemap: &Path) -> Rout
         .route("/search", get_only(search))
         .route("/autocomplete", get_only(autocomplete))
         .route("/geocode", get_only(geocode))
+        .route(
+            "/geocode/batch",
+            post_only(geocode_batch).layer(DefaultBodyLimit::max(bounds::MAX_BATCH_BODY_BYTES)),
+        )
         .route("/reverse", get_only(reverse))
         .route("/routing-filter", get_only(routing_filter))
         .route("/healthz", get_only(health::healthz))
@@ -309,6 +362,15 @@ where
     T: 'static,
 {
     on(MethodFilter::GET, handler).on(MethodFilter::HEAD, method::method_not_allowed)
+}
+
+/// A POST-only route. Every other method, HEAD included, is a 405 that says `Allow: POST`.
+fn post_only<H, T>(handler: H) -> MethodRouter<AppState>
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    on(MethodFilter::POST, handler).fallback(method::post_only_method_not_allowed)
 }
 
 /// Attach the request id (if present) to a Problem so it appears in the body.
@@ -412,45 +474,31 @@ async fn geocode(
             &request_id,
         )
     })?;
-
-    let address = bounds::validate_query_length(params.address.as_deref().unwrap_or_default())
+    let options = params
+        .into_options()
         .map_err(|problem| with_id(problem, &request_id))?;
-    if address.is_empty() {
-        return Err(with_id(
-            Problem::invalid_query("address must not be empty"),
-            &request_id,
-        ));
-    }
-    let context = |value: Option<String>| -> Result<Option<String>, Problem> {
-        let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())
-            .map_err(|problem| with_id(problem, &request_id))?;
-        Ok(Some(value).filter(|value| !value.is_empty()))
-    };
-    let locality = context(params.locality)?;
-    let region = context(params.region)?;
-    let postcode = context(params.postcode)?;
-    bounds::validate_search_limit(params.limit).map_err(|problem| with_id(problem, &request_id))?;
 
-    let options = AddressGeocodeOptions {
-        address: address.clone(),
-        locality,
-        region,
-        postcode,
-        limit: params.limit,
-        layer: params.layer,
-        street_fallback: params.street_fallback,
-    };
     let permit = acquire_permit(&state, &request_id).await?;
     let searcher = Arc::clone(&state.searcher);
-    let hit = task::spawn_blocking(move || {
+    let response = task::spawn_blocking(move || {
         let _permit = permit;
-        searcher.geocode_address(options)
+        geocode_one(&searcher, options)
     })
     .await
     .map_err(|error| internal(error, &request_id))?
     .map_err(|error| search_error(error, &request_id))?;
 
-    Ok(Json(match hit {
+    Ok(Json(response))
+}
+
+/// One validated `/geocode` lookup, answered the way both `/geocode` and `/geocode/batch` do: the
+/// rewrite that matched with its hit, or the address itself with a `null` result.
+fn geocode_one(
+    searcher: &PackTextSearcher,
+    options: AddressGeocodeOptions,
+) -> anyhow::Result<GeocodeResponse> {
+    let address = options.address.clone();
+    Ok(match searcher.geocode_address(options)? {
         Some(hit) => GeocodeResponse {
             query: hit.query,
             result: Some(SearchApiResult::from_hit(hit.hit)),
@@ -459,7 +507,115 @@ async fn geocode(
             query: address,
             result: None,
         },
-    }))
+    })
+}
+
+/// `POST /geocode/batch`: many `/geocode` lookups in one request, answered in the order asked.
+///
+/// A client geocoding millions of addresses otherwise pays an HTTP request, and its own
+/// per-request CPU, for each. An item is the parameters of `GET /geocode` as JSON and is
+/// validated exactly like it; an invalid one answers its own Problem and does not fail the rest.
+/// Only a body that is not the batch itself (malformed, too many items, too large) fails the
+/// request.
+///
+/// The items run in chunks of [`BATCH_CHUNK`] on the blocking pool, each chunk under one of the
+/// slots `/geocode` takes one of per request. So a batch is held to the same `--max-concurrency`
+/// as the single routes, however many cores it could use, and shares the slots with them in
+/// arrival order. One slot for the whole batch would let it run on every core and still count as
+/// one request. A batch that cannot get its first slot in time is shed like any request (503);
+/// one that gets some and then none answers `overloaded` for the items it did not run, which the
+/// client retries, instead of throwing away the work done.
+async fn geocode_batch(
+    State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
+    body: Result<axum::body::Bytes, BytesRejection>,
+) -> Result<Json<BatchResponse>, Problem> {
+    let request_id = request_id.map(|Extension(RequestId(id))| id);
+    let items = bounds::validate_batch(body).map_err(|problem| with_id(problem, &request_id))?;
+    let total = items.len();
+
+    // Validated up front: it is cheap, and an item that is not a lookup costs no search.
+    let lookups = items.into_iter().map(|item| {
+        serde_json::from_value::<GeocodeParams>(item)
+            .map_err(|_| {
+                Problem::malformed_parameter(
+                    "an item must be an object of address, locality, region, postcode, layer, limit and street_fallback",
+                )
+            })
+            .and_then(GeocodeParams::into_options)
+            .map_err(|problem| with_id(problem, &request_id))
+    });
+
+    let mut lookups = lookups.peekable();
+    let mut chunks = Vec::new();
+    let mut shed = false;
+    while lookups.peek().is_some() {
+        let chunk: Vec<_> = lookups.by_ref().take(BATCH_CHUNK).collect();
+        let len = chunk.len();
+        let permit = if shed {
+            None
+        } else {
+            match acquire_permit(&state, &request_id).await {
+                Ok(permit) => Some(permit),
+                // Nothing has run yet, so the whole request is shed.
+                Err(problem) if chunks.is_empty() => return Err(problem),
+                Err(_) => {
+                    shed = true;
+                    None
+                }
+            }
+        };
+        let handle = permit.map(|permit| {
+            let searcher = Arc::clone(&state.searcher);
+            let request_id = request_id.clone();
+            task::spawn_blocking(move || {
+                let _permit = permit;
+                chunk
+                    .into_iter()
+                    .map(|lookup| match lookup {
+                        Ok(options) => match geocode_one(&searcher, options) {
+                            Ok(answer) => BatchItem::Answer(Box::new(answer)),
+                            Err(error) => BatchItem::Failed {
+                                problem: search_error(error, &request_id),
+                            },
+                        },
+                        Err(problem) => BatchItem::Failed { problem },
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        chunks.push((len, handle));
+    }
+
+    let mut results = Vec::with_capacity(total);
+    for (len, handle) in chunks {
+        match handle {
+            Some(handle) => {
+                results.extend(handle.await.map_err(|error| internal(error, &request_id))?)
+            }
+            None => results.extend((0..len).map(|_| BatchItem::Failed {
+                problem: with_id(Problem::overloaded(), &request_id),
+            })),
+        }
+    }
+
+    let found = results
+        .iter()
+        .filter(|item| matches!(item, BatchItem::Answer(answer) if answer.result.is_some()))
+        .count();
+    let answered = results
+        .iter()
+        .filter(|item| matches!(item, BatchItem::Answer(_)))
+        .count();
+    tracing::info!(
+        request_id = request_id.as_deref().unwrap_or("-"),
+        items = total,
+        found,
+        not_found = answered - found,
+        problems = total - answered,
+        "geocode batch"
+    );
+    Ok(Json(BatchResponse { results }))
 }
 
 async fn autocomplete(
@@ -921,6 +1077,263 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    fn post(uri: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap()
+    }
+
+    fn batch_router(name: &str) -> (Router, PathBuf) {
+        let pack = temp_path(name);
+        write_pack(&pack);
+        let demo = temp_path(&format!("{name}-demo"));
+        let no_basemap = temp_path(&format!("{name}-no-basemap"));
+        (
+            build_router(state_for(&pack, true), &demo, &no_basemap),
+            pack,
+        )
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_answers_each_item_in_order_and_isolates_bad_ones() {
+        let (router, pack) = batch_router("batch");
+        let items = serde_json::json!({ "items": [
+            { "address": "10 King Street", "postcode": "M5V 1A1" },
+            { "address": "10 King Street", "postcode": "V6B 1A1" },
+            { "locality": "Toronto" },
+            { "address": "10 King Street", "limit": 999999 },
+            { "address": "10 King Street", "limit": "many" },
+            "10 King Street",
+            { "address": "x".repeat(300) },
+            { "address": "  10 King Street  " },
+        ]});
+        let mut batch = post("/geocode/batch", items.to_string());
+        batch
+            .headers_mut()
+            .insert("cf-ray", header::HeaderValue::from_static("ray-batch-1"));
+        let reply = send(router.clone(), batch).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.content_type(), "application/json");
+        assert_eq!(reply.request_id().as_deref(), Some("ray-batch-1"));
+        let body = reply.json();
+        let results = body["results"].as_array().expect("results");
+        assert_eq!(results.len(), 8);
+
+        assert_eq!(results[0]["result"]["layer"], "address");
+        assert_eq!(results[0]["result"]["point"]["lon"], -79.0);
+        // Not in that postcode: a null result keeps the address as its query.
+        assert!(results[1]["result"].is_null());
+        assert_eq!(results[1]["query"], "10 King Street");
+        // Each of these is the Problem the same parameters get from GET /geocode.
+        let problem = |i: usize, code: &str| {
+            let problem = &results[i]["problem"];
+            assert_eq!(problem["error_code"], code, "item {i}");
+            assert_eq!(problem["status"], 400, "item {i}");
+            assert_eq!(problem["request_id"], "ray-batch-1", "item {i}");
+            assert!(results[i].get("result").is_none(), "item {i}");
+        };
+        problem(2, "invalid_query");
+        problem(3, "limit_too_large");
+        assert_eq!(results[3]["problem"]["invalid_params"][0]["name"], "limit");
+        problem(4, "malformed_parameter");
+        problem(5, "malformed_parameter");
+        problem(6, "invalid_query");
+        // The address is trimmed, as on GET.
+        assert_eq!(results[7]["result"]["layer"], "address");
+
+        // The batch of one is the GET answer.
+        let get = send(
+            router.clone(),
+            request(
+                "GET",
+                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
+            ),
+        )
+        .await;
+        assert_eq!(results[0], get.json());
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_keeps_the_order_across_chunks() {
+        let (router, pack) = batch_router("batch-chunks");
+        // Three kinds of item in turn, over several chunks: found, not found (its query names its
+        // position) and invalid.
+        let count = BATCH_CHUNK * 3 + 5;
+        let items: Vec<_> = (0..count)
+            .map(|i| match i % 3 {
+                0 => serde_json::json!({ "address": "10 King Street" }),
+                1 => serde_json::json!({ "address": format!("99 Nowhere Road {i}") }),
+                _ => serde_json::json!({ "address": "10 King Street", "limit": 999999 }),
+            })
+            .collect();
+        let reply = send(
+            router,
+            post(
+                "/geocode/batch",
+                serde_json::json!({ "items": items }).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let results = body["results"].as_array().expect("results");
+        assert_eq!(results.len(), count);
+        for (i, result) in results.iter().enumerate() {
+            match i % 3 {
+                0 => assert_eq!(result["result"]["layer"], "address", "item {i}"),
+                1 => {
+                    assert!(result["result"].is_null(), "item {i}");
+                    assert_eq!(result["query"], format!("99 Nowhere Road {i}"));
+                }
+                _ => assert_eq!(
+                    result["problem"]["error_code"], "limit_too_large",
+                    "item {i}"
+                ),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_answers_overloaded_for_the_chunks_it_could_not_run() {
+        let pack = temp_path("batch-partial-shed");
+        write_pack(&pack);
+        let demo = temp_path("batch-partial-shed-demo");
+        let no_basemap = temp_path("batch-partial-shed-no-basemap");
+        // One slot and no patience: the first chunk takes it, and a later one may find it taken.
+        // Whether it does depends on timing, so only what must hold either way is checked: the
+        // answer is complete and in order, the first chunk ran, and once a chunk was shed so is
+        // everything after it.
+        let mut state = state_for(&pack, true);
+        state.permits = Arc::new(Semaphore::new(1));
+        state.queue_timeout = Duration::ZERO;
+        let router = build_router(state, &demo, &no_basemap);
+
+        let count = BATCH_CHUNK * 12;
+        let items = vec![serde_json::json!({ "address": "10 King Street" }); count];
+        let reply = send(
+            router,
+            post(
+                "/geocode/batch",
+                serde_json::json!({ "items": items }).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let body = reply.json();
+        let results = body["results"].as_array().expect("results");
+        assert_eq!(results.len(), count);
+        let shed: Vec<bool> = results
+            .iter()
+            .map(|result| result["problem"]["error_code"] == "overloaded")
+            .collect();
+        assert!(
+            results[..BATCH_CHUNK]
+                .iter()
+                .all(|r| r["result"]["layer"] == "address")
+        );
+        assert!(shed.windows(2).all(|pair| !pair[0] || pair[1]));
+        assert!(
+            results
+                .iter()
+                .zip(&shed)
+                .all(|(result, shed)| *shed || result["result"]["layer"] == "address")
+        );
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_rejects_a_body_that_is_not_a_batch() {
+        let (router, pack) = batch_router("batch-bounds");
+
+        for body in [
+            "",
+            "not json",
+            "[]",
+            "{}",
+            r#"{"items": "x"}"#,
+            r#"{"items": [1}"#,
+        ] {
+            let reply = send(router.clone(), post("/geocode/batch", body)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body:?}");
+            assert_eq!(reply.content_type(), "application/problem+json");
+            assert_eq!(reply.json()["error_code"], "malformed_parameter");
+            assert!(reply.json()["request_id"].is_string());
+        }
+
+        // An empty batch is a valid batch with no results.
+        let reply = send(router.clone(), post("/geocode/batch", r#"{"items": []}"#)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json(), serde_json::json!({ "results": [] }));
+
+        // The cap is on the item count: one over is a 413 Problem, the cap itself is answered.
+        let items = |count: usize| {
+            serde_json::json!({ "items": vec![serde_json::json!({ "address": "10 King Street" }); count] })
+                .to_string()
+        };
+        let reply = send(
+            router.clone(),
+            post("/geocode/batch", items(bounds::MAX_BATCH_ITEMS + 1)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "batch_too_large");
+        let reply = send(
+            router.clone(),
+            post("/geocode/batch", items(bounds::MAX_BATCH_ITEMS)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["results"].as_array().map(Vec::len),
+            Some(bounds::MAX_BATCH_ITEMS)
+        );
+
+        // So is the body size, whatever the item count.
+        let padding = " ".repeat(bounds::MAX_BATCH_BODY_BYTES);
+        let reply = send(
+            router,
+            post("/geocode/batch", format!(r#"{{"items": []{padding}}}"#)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.content_type(), "application/problem+json");
+        assert_eq!(reply.json()["error_code"], "batch_too_large");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
+    async fn geocode_batch_is_post_only() {
+        let (router, pack) = batch_router("batch-method");
+        for method in ["GET", "HEAD", "PUT", "DELETE"] {
+            let reply = send(router.clone(), request(method, "/geocode/batch")).await;
+            assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(reply.content_type(), "application/problem+json");
+            assert_eq!(
+                reply
+                    .headers
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method}"
+            );
+        }
+        // And /geocode stays GET only.
+        let reply = send(router, post("/geocode", r#"{"items": []}"#)).await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     #[tokio::test]
     async fn reverse_validates_coordinates() {
         let pack = temp_path("reverse-bounds");
@@ -1076,6 +1489,25 @@ mod router_tests {
             assert_eq!(reply.json()["error_code"], "overloaded");
             assert!(reply.json()["request_id"].is_string());
         }
+
+        // A batch that cannot get its first slot is shed whole, like a single request.
+        let reply = send(
+            router.clone(),
+            post(
+                "/geocode/batch",
+                r#"{"items": [{"address": "10 King Street"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.json()["error_code"], "overloaded");
+        assert_eq!(
+            reply
+                .headers
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
 
         // Health probes never wait for a slot.
         let reply = send(router.clone(), request("GET", "/healthz")).await;

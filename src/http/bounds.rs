@@ -7,6 +7,10 @@
 //! server-side enforcement point. These are deliberately conservative, hardcoded
 //! limits for the non-commercial public demo.
 
+use axum::{body::Bytes, extract::rejection::BytesRejection, http::StatusCode};
+use serde::Deserialize;
+use serde_json::Value;
+
 use crate::http::problem::{InvalidParam, Problem};
 use crate::search::MAX_AUTOCOMPLETE_LIMIT;
 
@@ -16,6 +20,40 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// Maximum `limit` a `/search` request may ask for. `search.rs` has no internal
 /// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
+
+/// Most items one `POST /geocode/batch` may carry. The router splits nothing: it accepts the same
+/// number, so a Runtime's sub-batch is never larger than this.
+pub(crate) const MAX_BATCH_ITEMS: usize = 1000;
+
+/// Largest `POST /geocode/batch` body. An item is at most four 256-character strings plus a few
+/// small fields, about 4 KiB in the worst case of 4-byte characters, so 1000 of them fit.
+pub(crate) const MAX_BATCH_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct BatchBody {
+    items: Vec<Value>,
+}
+
+/// The items of a batch body, bounded by size and count. Items stay raw JSON so that one with a
+/// wrong type is that item's problem, not the whole request's.
+pub(crate) fn validate_batch(body: Result<Bytes, BytesRejection>) -> Result<Vec<Value>, Problem> {
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            Problem::batch_too_large(format!("body must be at most {MAX_BATCH_BODY_BYTES} bytes"))
+        } else {
+            Problem::malformed_parameter("could not read the request body")
+        }
+    })?;
+    let BatchBody { items } = serde_json::from_slice(&body).map_err(|_| {
+        Problem::malformed_parameter("body must be a JSON object with an items array")
+    })?;
+    if items.len() > MAX_BATCH_ITEMS {
+        return Err(Problem::batch_too_large(format!(
+            "a batch may carry at most {MAX_BATCH_ITEMS} items"
+        )));
+    }
+    Ok(items)
+}
 
 /// Trim and bound a query by length, returning the trimmed string. Empty is
 /// allowed (autocomplete treats short/empty queries as "no suggestions").

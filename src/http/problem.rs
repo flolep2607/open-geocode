@@ -137,6 +137,13 @@ impl Problem {
         Self::new(StatusCode::BAD_REQUEST, "malformed_parameter").with_detail(detail)
     }
 
+    // --- 413 ---------------------------------------------------------------
+
+    /// A batch request with more items, or more bytes, than one request may carry.
+    pub(crate) fn batch_too_large(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "batch_too_large").with_detail(detail)
+    }
+
     // --- 404 / 405 ---------------------------------------------------------
 
     pub(crate) fn not_found() -> Self {
