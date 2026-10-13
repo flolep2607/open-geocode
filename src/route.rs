@@ -1652,7 +1652,7 @@ mod tests {
         };
         // Answers each item of a batch like /geocode would, but for the addresses `bad` (a 400
         // Problem), `shed` (a 503 Problem), `nothing` (a null result) and `garbage` (an entry that
-        // is not an object). Fails like /geocode does.
+        // is not an object); a batch that has a `short` address gets one result too few. Fails like /geocode does.
         let batch = {
             let fake = fake.clone();
             let geocode = geocode.clone();
@@ -1683,7 +1683,7 @@ mod tests {
                         }
                         return response;
                     }
-                    let results: Vec<Value> = addresses
+                    let mut results: Vec<Value> = addresses
                         .iter()
                         .map(|address| match address.as_str() {
                             "bad" => json!({ "problem": { "status": 400, "error_code": "invalid_query" } }),
@@ -1693,6 +1693,9 @@ mod tests {
                             _ => json!({ "query": address, "result": geocode }),
                         })
                         .collect();
+                    if addresses.iter().any(|address| address == "short") {
+                        results.pop();
+                    }
                     axum::Json(json!({ "results": results })).into_response()
                 }
             }
@@ -2916,6 +2919,113 @@ mod tests {
         assert_eq!(c.nz.batches(), vec![vec!["15 Eruera Street"]]);
         assert_eq!(c.au.batches().len(), 0);
         assert_eq!(c.ca.batches().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_shedding_a_whole_sub_batch_sheds_its_unnamed_items_too() {
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        c.nz.fail_with.store(503, Ordering::SeqCst);
+        c.nz.retry_after.store(true, Ordering::SeqCst);
+        let results = batch(
+            &c.base,
+            json!([
+                // Routed to NZ, not named: NZ's shedding stands, the others are not asked.
+                { "address": "15 Eruera Street", "locality": "Rotorua" },
+                { "address": "7 Eruera Street", "country": "nz" },
+                { "address": "3/12 George Street", "locality": "Sydney" },
+            ]),
+        )
+        .await;
+        for i in [0, 1] {
+            assert_eq!(
+                results[i]["problem"]["error_code"], "overloaded",
+                "item {i}"
+            );
+            assert_eq!(results[i]["problem"]["status"], 503, "item {i}");
+        }
+        assert_eq!(batch_route(&results[0]), Some("filter-street-town"));
+        assert_eq!(batch_route(&results[1]), Some("country"));
+        assert_eq!(results[2]["result"]["country"], "AU");
+        assert_eq!(c.nz.batches().len(), 1);
+        assert_eq!(c.au.batches(), vec![vec!["3/12 George Street"]]);
+        assert_eq!(c.ca.batches().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_answering_the_wrong_number_of_results_fails_its_items() {
+        let c = countries([found("au"), found("nz"), Value::Null]).await;
+        // NZ's sub-batch holds `short`, so NZ answers one result too few and none can be trusted.
+        let results = batch(
+            &c.base,
+            json!([
+                { "address": "short", "country": "NZ" },
+                { "address": "1 Toronto Road", "country": "NZ" },
+                // Routed to NZ, which gave nothing usable: the others are asked.
+                { "address": "15 Eruera Street", "locality": "Rotorua" },
+                { "address": "1 Toronto Road", "country": "CA" },
+            ]),
+        )
+        .await;
+        for i in [0, 1] {
+            assert_eq!(results[i]["problem"]["error_code"], "upstream_unavailable");
+            assert_eq!(batch_route(&results[i]), Some("country"));
+        }
+        assert_eq!(results[2]["result"]["country"], "AU");
+        assert_eq!(batch_route(&results[2]), Some("fanout"));
+        assert!(results[3]["result"].is_null());
+        assert_eq!(results[3]["country"], "CA");
+
+        // Asked of every Runtime, each giving a result too few: there is no answer to give.
+        let results = batch(&c.base, json!([{ "address": "short" }])).await;
+        assert_eq!(results[0]["problem"]["error_code"], "upstream_unavailable");
+    }
+
+    #[tokio::test]
+    async fn items_that_are_not_objects_are_that_items_problem_and_nothing_else() {
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        let results = batch(
+            &c.base,
+            json!([null, 7, true, "str", [], {}, { "address": "1 Toronto Road", "country": "CA" }]),
+        )
+        .await;
+        assert_eq!(results.len(), 7);
+        for result in &results[..4] {
+            assert_eq!(result["problem"]["error_code"], "malformed_parameter");
+            assert_eq!(result["problem"]["status"], 400);
+        }
+        assert_eq!(results[4]["problem"]["error_code"], "malformed_parameter");
+        // An object without an address is a lookup without one.
+        assert_eq!(results[5]["problem"]["error_code"], "invalid_query");
+        assert_eq!(results[6]["result"]["country"], "CA");
+        assert_eq!(c.ca.batches(), vec![vec!["1 Toronto Road"]]);
+        assert_eq!(c.au.batches().len() + c.nz.batches().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_body_up_to_the_limit_is_accepted_and_one_byte_over_is_a_413() {
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        let url = format!("{}/geocode/batch", c.base);
+        // The body padded to exactly `size` bytes with whitespace.
+        let body = |size: usize| {
+            let json = r#"{"items": []}"#;
+            format!(
+                "{}{}{}",
+                &json[..json.len() - 1],
+                " ".repeat(size - json.len()),
+                "}"
+            )
+        };
+        // Past axum's 2 MiB default, so the layer that raises it is what is tested.
+        for size in [3 * 1024 * 1024, bounds::MAX_BATCH_BODY_BYTES] {
+            let text = body(size);
+            assert_eq!(text.len(), size);
+            let (status, _, answer) = post_full(&url, text).await;
+            assert_eq!(status, StatusCode::OK, "{size}");
+            assert_eq!(answer, json!({ "results": [] }));
+        }
+        let (status, _, problem) = post_full(&url, body(bounds::MAX_BATCH_BODY_BYTES + 1)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(problem["error_code"], "batch_too_large");
     }
 
     #[tokio::test]

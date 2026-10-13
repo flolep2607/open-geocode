@@ -1442,6 +1442,36 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn geocode_batch_takes_a_body_up_to_the_limit_and_refuses_one_byte_over() {
+        let (router, pack) = batch_router("batch-body-limit");
+        // The body padded to exactly `size` bytes with whitespace.
+        let body = |size: usize| {
+            let json = r#"{"items": []}"#;
+            format!(
+                "{}{}{}",
+                &json[..json.len() - 1],
+                " ".repeat(size - json.len()),
+                "}"
+            )
+        };
+        // Past axum's 2 MiB default, so the layer that raises it is what is tested.
+        for size in [3 * 1024 * 1024, bounds::MAX_BATCH_BODY_BYTES] {
+            let reply = send(router.clone(), post("/geocode/batch", body(size))).await;
+            assert_eq!(reply.status, StatusCode::OK, "{size}");
+            assert_eq!(reply.json(), serde_json::json!({ "results": [] }));
+        }
+        let reply = send(
+            router,
+            post("/geocode/batch", body(bounds::MAX_BATCH_BODY_BYTES + 1)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(reply.json()["error_code"], "batch_too_large");
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[tokio::test]
     async fn geocode_batch_is_post_only() {
         let (router, pack) = batch_router("batch-method");
         for method in ["GET", "HEAD", "PUT", "DELETE"] {
