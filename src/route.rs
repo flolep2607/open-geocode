@@ -1106,6 +1106,10 @@ enum Reply {
 
 impl Reply {
     fn of(mut result: Value) -> Self {
+        // An entry that is not an object is no answer, whatever else the Runtime said.
+        if !result.is_object() {
+            return Self::Failed { shed: false };
+        }
         match result.get_mut("problem").map(Value::take) {
             Some(problem) => Self::Problem(problem),
             None => Self::Answer(result),
@@ -1131,7 +1135,9 @@ fn problem_item(problem: Problem, id: Option<&str>) -> Value {
 
 /// The item with how it was routed, the per-item `x-route`.
 fn with_route(mut item: Value, route: &str) -> Value {
-    item["route"] = route.into();
+    if let Some(item) = item.as_object_mut() {
+        item.insert("route".to_string(), route.into());
+    }
     item
 }
 
@@ -1623,7 +1629,8 @@ mod tests {
             }
         };
         // Answers each item of a batch like /geocode would, but for the addresses `bad` (a 400
-        // Problem), `shed` (a 503 Problem) and `nothing` (a null result). Fails like /geocode does.
+        // Problem), `shed` (a 503 Problem), `nothing` (a null result) and `garbage` (an entry that
+        // is not an object). Fails like /geocode does.
         let batch = {
             let fake = fake.clone();
             let geocode = geocode.clone();
@@ -1660,6 +1667,7 @@ mod tests {
                             "bad" => json!({ "problem": { "status": 400, "error_code": "invalid_query" } }),
                             "shed" => json!({ "problem": { "status": 503, "error_code": "overloaded" } }),
                             "nothing" => json!({ "query": address, "result": null }),
+                            "garbage" => json!("garbage"),
                             _ => json!({ "query": address, "result": geocode }),
                         })
                         .collect();
@@ -2748,6 +2756,30 @@ mod tests {
         let results = batch(&c.base, items).await;
         assert_eq!(results[0]["problem"]["error_code"], "overloaded");
         assert_eq!(results[1]["problem"]["error_code"], "overloaded");
+    }
+
+    #[tokio::test]
+    async fn a_result_entry_that_is_not_an_object_fails_its_item_and_no_other() {
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        let results = batch(
+            &c.base,
+            json!([
+                { "address": "garbage", "country": "NZ" },
+                { "address": "1 Toronto Road", "country": "CA" },
+                // Routed to NZ, which gave nothing usable: the others are asked, and they too.
+                { "address": "garbage", "prefer": "NZ" },
+                { "address": "garbage" },
+            ]),
+        )
+        .await;
+        assert_eq!(results[0]["problem"]["error_code"], "upstream_unavailable");
+        assert_eq!(results[0]["problem"]["status"], 502);
+        assert_eq!(batch_route(&results[0]), Some("country"));
+        assert_eq!(results[1]["result"]["country"], "CA");
+        assert_eq!(results[2]["problem"]["error_code"], "upstream_unavailable");
+        assert_eq!(batch_route(&results[2]), Some("fanout"));
+        assert_eq!(results[3]["problem"]["error_code"], "upstream_unavailable");
+        assert_eq!(batch_route(&results[3]), Some("fanout"));
     }
 
     #[tokio::test]
