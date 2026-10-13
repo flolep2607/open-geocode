@@ -144,7 +144,7 @@ Only a leading house number is read: an address written with the number after th
 `/search`, `/autocomplete` and `/geocode` take an optional `prefer` for when `country` is absent (`country` wins over it).
 It is a soft hint, for example the country of an invoice's currency, and a currency can be wrong: an NZ supplier may bill in AUD, a Canadian one in USD.
 So it ranks below what the address itself says, and above everything that is only a guess.
-A `prefer` that is not a configured `--worker` (`EU`, a typo) is ignored, case aside, and routing is exactly as without it.
+A `prefer` that is not a configured `--worker` (`EU`, a typo, a currency code such as `AUD`) is ignored, case aside, and routing is exactly as without it.
 With one that is:
 
 1. If exactly one country's filter holds the street with the town, the request goes there, even when it is not `prefer` (`x-route: filter-street-town`).
@@ -155,6 +155,10 @@ With one that is:
 
 `x-route-country` names the country in every case.
 A routed Runtime that fails or finds nothing is followed by the fan-out, `prefer` included.
+A 4xx or a load-shedding 503 from the `prefer` Runtime goes back as it is, with no fan-out, as for any routed Runtime.
+Two costs of a wrong `prefer` are accepted: rungs 2 and 4 do not look at `street_alone`, so a name or a street typed so far with no `locality` goes to `prefer` and its answer, if not empty, replaces the fan-out merge; and a filter false positive (about 1 in 256 per street reading) on `prefer` takes rung 2 over the one Runtime that really holds the street.
+Neither has been measured against wrong-currency swaps on the gold set.
+`prefer` is also forwarded to the Runtimes in the query string, which they ignore.
 
 A Runtime without a readable filter counts as holding anything, so it never lets another win alone, but it never wins alone either: a request is routed only when a filter confirms the country.
 A routed Runtime that fails, or answers with nothing, is followed by the fan-out, because a filter can be wrong (a false positive, a town spelled another way).
