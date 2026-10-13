@@ -184,7 +184,7 @@ impl GeocodeParams {
     fn into_options(self) -> Result<AddressGeocodeOptions, Problem> {
         let address = bounds::validate_query_length(self.address.as_deref().unwrap_or_default())?;
         if address.is_empty() {
-            return Err(Problem::invalid_query("address must not be empty"));
+            return Err(bounds::empty_address());
         }
         let context = |value: Option<String>| -> Result<Option<String>, Problem> {
             let value = bounds::validate_query_length(value.as_deref().unwrap_or_default())?;
@@ -553,11 +553,7 @@ async fn geocode_batch(
     // Validated up front: it is cheap, and an item that is not a lookup costs no search.
     let lookups = items.into_iter().map(|item| {
         serde_json::from_value::<GeocodeParams>(item)
-            .map_err(|_| {
-                Problem::malformed_parameter(
-                    "an item must be an object of address, locality, region, postcode, layer, limit and street_fallback",
-                )
-            })
+            .map_err(|_| bounds::malformed_batch_item())
             .and_then(GeocodeParams::into_options)
             .map_err(|problem| with_id(problem, &request_id))
     });

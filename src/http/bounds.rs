@@ -70,6 +70,19 @@ pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
     Ok(query.to_string())
 }
 
+/// The Problem for a `/geocode/batch` item that is not an object of lookup parameters. Shared by the
+/// Runtime and the router, which answers such an item itself instead of asking every Runtime.
+pub(crate) fn malformed_batch_item() -> Problem {
+    Problem::malformed_parameter(
+        "an item must be an object of address, locality, region, postcode, layer, limit and street_fallback",
+    )
+}
+
+/// The Problem for a `/geocode` lookup without an address.
+pub(crate) fn empty_address() -> Problem {
+    Problem::invalid_query("address must not be empty")
+}
+
 /// Like [`validate_query_length`] but additionally rejects an empty query, for
 /// `/search` where an empty `q` is a client error.
 pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {

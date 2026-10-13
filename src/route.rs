@@ -262,6 +262,23 @@ impl RouteState {
                 None => Plan::Fanout,
             }
         };
+        // An item no Runtime can answer is answered here, as the Runtime would, rather than sent
+        // to each one to be refused. Its route is where it would have gone.
+        let invalid = match (item, item.get("address")) {
+            (Value::Object(_), Some(Value::String(address))) if !address.trim().is_empty() => None,
+            (Value::Object(_), None | Some(Value::Null | Value::String(_))) => {
+                Some(bounds::empty_address())
+            }
+            _ => Some(bounds::malformed_batch_item()),
+        };
+        let plan = match (invalid, plan) {
+            (Some(problem), Plan::One { route, .. }) => Plan::Invalid { problem, route },
+            (Some(problem), Plan::Fanout) => Plan::Invalid {
+                problem,
+                route: "fanout",
+            },
+            (_, plan) => plan,
+        };
         (plan, keys)
     }
 
@@ -1070,6 +1087,11 @@ enum Plan {
     },
     /// Every Runtime.
     Fanout,
+    /// An item that is not a lookup: nobody is asked, and `route` is where it would have gone.
+    Invalid {
+        problem: Problem,
+        route: &'static str,
+    },
 }
 
 /// What one Runtime said about one batch item.
@@ -1182,7 +1204,8 @@ fn pick_item(
 ///
 /// An item answers `{ query, result, route }` or `{ problem, route }`; `route` is the `x-route` of
 /// the GET, and a result carries its `country` as routed `/geocode` results do (also when the
-/// item named the country, which GET leaves untagged). A Runtime that does not answer a sub-batch
+/// item named the country, which GET leaves untagged). An item that is not an object, or has no non-empty string `address`, is answered here with the
+/// Problem a Runtime would give, and asked of nobody. A Runtime that does not answer a sub-batch
 /// fails its items only, as `upstream_unavailable` (`overloaded` when it shed load). As on GET,
 /// an item whose routed Runtime has no answer, or fails, is then asked of the others.
 async fn geocode_batch(
@@ -1208,6 +1231,9 @@ async fn geocode_batch(
                 let problem = Problem::unknown_country(country, &state.known());
                 results[index] = Some(problem_item(problem, id));
             }
+            Plan::Invalid { problem, route } => {
+                results[index] = Some(with_route(problem_item(problem.clone(), id), route));
+            }
             Plan::One { country, .. } => asks.entry(country.clone()).or_default().push(index),
             Plan::Fanout => {
                 for country in state.workers.keys() {
@@ -1226,7 +1252,7 @@ async fn geocode_batch(
     let mut retried = 0;
     for (index, plan) in plans.iter().enumerate() {
         match plan {
-            Plan::Unknown(_) => {}
+            Plan::Unknown(_) | Plan::Invalid { .. } => {}
             Plan::One {
                 country,
                 route,
@@ -2735,6 +2761,47 @@ mod tests {
         assert_eq!(results[0]["problem"]["error_code"], "overloaded");
         assert_eq!(results[1]["result"]["country"], "CA");
         assert_eq!(c.au.batches().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_item_without_an_address_is_answered_by_the_router_and_asked_of_nobody() {
+        let c = countries([found("au"), found("nz"), found("ca")]).await;
+        let results = batch(
+            &c.base,
+            json!([
+                "10 King Street",
+                [1, 2],
+                { "locality": "Rotorua" },
+                { "address": null },
+                { "address": "  " },
+                { "address": 5 },
+                { "address": "", "country": "nz" },
+                { "address": "", "prefer": "ca" },
+                { "address": "", "country": "FR" },
+                { "address": "15 Eruera Street", "locality": "Rotorua" },
+            ]),
+        )
+        .await;
+        let problem = |i: usize, code: &str, route: Option<&str>| {
+            assert_eq!(results[i]["problem"]["error_code"], code, "item {i}");
+            assert_eq!(results[i]["problem"]["status"], 400, "item {i}");
+            assert_eq!(batch_route(&results[i]), route, "item {i}");
+        };
+        problem(0, "malformed_parameter", Some("fanout"));
+        problem(1, "malformed_parameter", Some("fanout"));
+        problem(2, "invalid_query", Some("fanout"));
+        problem(3, "invalid_query", Some("fanout"));
+        problem(4, "invalid_query", Some("fanout"));
+        problem(5, "malformed_parameter", Some("fanout"));
+        problem(6, "invalid_query", Some("country"));
+        problem(7, "invalid_query", Some("prefer-fallback"));
+        // An unknown country is still the router's own Problem, without a route.
+        problem(8, "unknown_country", None);
+        assert_eq!(results[9]["result"]["country"], "NZ");
+        // Only the valid item reached a Runtime.
+        assert_eq!(c.nz.batches(), vec![vec!["15 Eruera Street"]]);
+        assert_eq!(c.au.batches().len(), 0);
+        assert_eq!(c.ca.batches().len(), 0);
     }
 
     #[tokio::test]
