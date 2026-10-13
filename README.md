@@ -62,6 +62,9 @@ cargo run --release -- build --input planet.osm.pbf --pack data/planet --memory-
 - `--scratch-dir` puts temporary files on a different disk; it defaults to the Pack directory.
   Each sorted run is deleted as soon as it has been merged, and the whole scratch directory is removed when the build ends.
   Ontario writes about 1 GB of scratch in total for a 0.94 GB input.
+- The routing filter (see [Routing packs by country](#routing-packs-by-country)) gathers one 64-bit hash per street key in a sorter that takes an eighth of a sorter's share, so it spills like the others, and is deduplicated and built one shard of at most about 4 million keys at a time.
+  The shard's `Vec<u64>` (32 MB) is reserved from the pool; xorf's construction scratch for it (a few times that, about 150 MB transient, the same whatever the input size) and the table of admin place names it needs to add towns (16 bytes per admin place) are outside the pool, like the boundary polygons.
+  The planet figures are estimates, about 100 to 150 million unique keys and a 115 to 170 MB section; the build report records the measured keys pushed (`scratch.sorters.routing_keys`), the unique keys (`output.routing_filter_keys`) and the section size.
 - The input must be sorted by type and id, which Geofabrik and planet.openstreetmap.org files are.
   Run `osmium sort` on anything else; the builder stops with an error on unsorted nodes.
 - Admin boundary polygons and postcode centroids grow with the number of boundaries and postcodes, not with the number of addresses.
@@ -94,6 +97,39 @@ Published versions are retained, so repeated builds use additional disk space.
 A Pack is one file, `generations/<id>/pack.ogp`.
 Every command that takes `--pack` accepts either the Pack directory or that file, so you can copy, cache, or upload the file on its own.
 The build audit (`audit/rejections.jsonl` and `audit/build-report.json`) sits next to the file but is not part of the Pack you serve.
+
+## Routing packs by country
+
+`open-geocode route` puts one URL in front of one Runtime per country Pack (`--worker NZ=http://127.0.0.1:8081`, repeated).
+Requests with `country=XX` go to that country's Runtime; `/reverse` always needs `country`.
+Requests without one are routed by street, not by comparing the raw scores of different Packs.
+
+**The `routing/filter` section.**
+The builder writes it into every Pack that has a street: a binary fuse filter over hashes of `street` and `street|town` for every address, interpolation and street record.
+Towns are the record's own locality and the district, locality, neighbourhood and place boundaries around it.
+Keys use the same normalization as the text index, so a query's street hashes like a stored one.
+It costs about 1.2 bytes per key and has about 0.4% false positives and no false negatives.
+It is a section of its own version: Packs without it still open, and older binaries ignore it.
+
+**`GET /routing-filter`.**
+The Runtime serves the section's bytes as `application/octet-stream`, straight from the mapped file, with the section checksum as `ETag` (`If-None-Match` gets a 304).
+The format, version and hash seed are in the section's header.
+A Pack without a filter answers a 404 Problem.
+GET only, like the rest of the API.
+
+**Router behaviour.**
+For `/geocode` the street is `address` without its house number and unit and the town is `locality`; for `/search` and `/autocomplete` the street comes from `q` and `locality` is an optional hint that the Runtimes ignore.
+
+1. If exactly one country's filter holds the street with the town, the request goes there.
+2. Else if exactly one holds the street, it goes there.
+3. Else every Runtime is asked: `/search` and `/autocomplete` merge by score, and `/geocode` answers the one non-null result (several: a Runtime whose filter holds the street first, then the highest score).
+
+A Runtime without a readable filter counts as holding anything, so it never lets another win alone.
+A routed Runtime that fails is replaced by the fan-out.
+Responses carry `x-route` (`filter-street-town`, `filter-street`, `fanout`, or `country` when `country=XX` was given) and, when one Runtime answered, `x-route-country`; routed and merged results carry a `country`.
+
+The router fetches every filter at startup, then every `--filter-refresh-secs` (default 300, `0` turns the timer off), and again as soon as `/readyz` finds a Runtime that was not ready is ready, so a swapped Pack is picked up without restarting the router.
+An unchanged filter costs a 304.
 
 ## Hosted demo
 
