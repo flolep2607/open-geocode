@@ -17,13 +17,13 @@
 //!   typed so far may be the start of another. A Runtime without a filter might hold anything,
 //!   so it blocks a single winner but never wins by default. The routed answer carries
 //!   `x-route` (`filter-street-town` or `filter-street`) and `x-route-country`, and its results
-//!   a `country`.
+//!   a `country`. A routed Runtime that fails, or finds nothing, does not end the request: the
+//!   filters can be wrong, so it goes on to every Runtime.
 //! - `prefer=XX` (a hint taken from an invoice currency, which is not a fact) changes the order
 //!   when `country` is absent: a unique street|town holder still wins, even over `prefer`, since
 //!   the currency can be wrong; then `prefer` wins if it may hold the street; then a unique
 //!   street holder; then `prefer` anyway (`x-route`: `prefer`, `prefer-fallback`). A `prefer`
-//!   that is not a configured Runtime is ignored. See [`RouteState::decide`]. A routed Runtime that fails, or finds nothing, does not end the request: the
-//!   filters can be wrong, so it goes on to every Runtime.
+//!   that is not a configured Runtime is ignored. See [`RouteState::decide`].
 //! - When the filters cannot decide (zero or several Runtimes hold the street, or a request with
 //!   no street) the request goes to every Runtime at once, as before (`x-route: fanout`).
 //!   `/search` and `/autocomplete` results are merged and cut to `limit`, each carrying the
@@ -1949,7 +1949,6 @@ mod tests {
         assert_eq!(route_of(&headers), (Some("fanout"), Some("AU")));
         assert_eq!(body["result"]["label"], "found");
         // NZ was asked twice: as the routed Runtime, then again with the others.
-        // NZ was asked first as prefer, found nothing, and is asked again with the rest.
         assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (1, 2, 1));
 
         // Lists too: NZ answers an empty list, AU has results.
