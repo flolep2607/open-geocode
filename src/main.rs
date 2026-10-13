@@ -1,4 +1,4 @@
-use std::{fs::File, net::SocketAddr, path::PathBuf};
+use std::{fs::File, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -182,8 +182,10 @@ enum Commands {
     },
     /// Serve one HTTP entry point in front of one Runtime per country Pack.
     ///
-    /// Requests with `country=XX` go to that country's Runtime; /search and /autocomplete
-    /// without it go to every Runtime and are merged by score.
+    /// Requests with `country=XX` go to that country's Runtime. Without it the router picks the
+    /// country whose Pack holds the request's street (each Runtime serves a membership filter at
+    /// /routing-filter) and, when that is not decided, asks every Runtime: /search and
+    /// /autocomplete results are merged by score, /geocode keeps the one found address.
     Route {
         /// A Runtime as COUNTRY=URL, e.g. NZ=http://127.0.0.1:8081. Repeat per country.
         #[arg(long = "worker", required = true)]
@@ -192,6 +194,12 @@ enum Commands {
         /// Address and port to bind.
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+
+        /// Seconds between fetches of every Runtime's routing filter, so a swapped Pack is
+        /// picked up without restarting the router. 0 turns the timer off: the filters are
+        /// still fetched at startup and when a Runtime comes back ready.
+        #[arg(long, default_value_t = 300)]
+        filter_refresh_secs: u64,
     },
 }
 
@@ -348,7 +356,11 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Route { workers, bind } => {
+        Commands::Route {
+            workers,
+            bind,
+            filter_refresh_secs,
+        } => {
             let workers = workers
                 .into_iter()
                 .map(|w| match w.split_once('=') {
@@ -356,7 +368,12 @@ async fn main() -> Result<()> {
                     None => bail!("--worker takes COUNTRY=URL, got {w:?}"),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            route(RouteOptions { workers, bind }).await
+            route(RouteOptions {
+                workers,
+                bind,
+                filter_refresh: Duration::from_secs(filter_refresh_secs),
+            })
+            .await
         }
     }
 }

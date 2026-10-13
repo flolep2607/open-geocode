@@ -478,6 +478,7 @@ impl<B: AsRef<[u8]>> RoutingFilter<B> {
         self.key_count
     }
 
+    #[cfg(test)]
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
     }
