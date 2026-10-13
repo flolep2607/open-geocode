@@ -11,16 +11,23 @@
 //!   to the one Runtime whose filter holds its street, first by street|town, then by street
 //!   alone. Raw search scores of different Packs are not comparable, which is why scores are not
 //!   used to choose. The street comes from `address` (`/geocode`) or `q` (`/search`,
-//!   `/autocomplete`) with the house number and unit dropped, the town from `locality`. A
-//!   Runtime without a filter might hold anything. The routed answer carries `x-route`
-//!   (`filter-street-town` or `filter-street`) and `x-route-country`, and its results a `country`.
+//!   `/autocomplete`) with the house number and unit dropped, the town from `locality`. The street
+//!   alone routes `/geocode`, and `/search` with a house number or a `locality`; `/autocomplete`
+//!   routes only with a `locality`, because a name with no number may be a place, and a street
+//!   typed so far may be the start of another. A Runtime without a filter might hold anything,
+//!   so it blocks a single winner but never wins by default. The routed answer carries
+//!   `x-route` (`filter-street-town` or `filter-street`) and `x-route-country`, and its results
+//!   a `country`. A routed Runtime that fails, or finds nothing, does not end the request: the
+//!   filters can be wrong, so it goes on to every Runtime.
 //! - When the filters cannot decide (zero or several Runtimes hold the street, or a request with
 //!   no street) the request goes to every Runtime at once, as before (`x-route: fanout`).
 //!   `/search` and `/autocomplete` results are merged by score and cut to `limit`, each carrying
-//!   the `country` it came from. `/geocode` answers one best match or `null`, and the Runtime
-//!   only answers non-null when its locality, region and postcode checks pass, so a single
-//!   non-null answer is real evidence; if several come back, a Runtime whose filter holds the
-//!   street is preferred, then the highest score.
+//!   the `country` it came from. `/geocode` answers one best match or `null`. A single non-null
+//!   answer wins. Several do not pick a winner by score, which is not comparable across Packs,
+//!   and a request with only an address gives the Runtimes no locality, region or postcode to
+//!   check, so each answers for any street it has: unless exactly one of the answering Runtimes
+//!   has a filter that holds the street, the router answers `country_required`, as it did
+//!   before it could fan out `/geocode`.
 //! - `/reverse` needs `country`: a coordinate carries no street to route by.
 //! - `/readyz` is ready only when every Runtime is.
 //!
@@ -65,13 +72,17 @@ use crate::{
         request_id::{self, RequestId},
     },
     search::DEFAULT_SEARCH_LIMIT,
-    street_filter::{RoutingFilter, pair_hash, query_street_hash, town_hash},
+    street_filter::{RoutingFilter, pair_hash, query_street_hashes, town_hash},
 };
 
 /// How long the router waits for one Runtime before answering 502 (or leaving it out of a merge).
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 /// A routing filter is megabytes to hundreds of them, so it gets longer than an answer does.
 const FILTER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How soon a Runtime that has no filter is asked for one again, when the refresh interval is
+/// longer.
+const FILTER_RETRY: Duration = Duration::from_secs(15);
 
 const ROUTE_HEADER: HeaderName = HeaderName::from_static("x-route");
 const ROUTE_COUNTRY_HEADER: HeaderName = HeaderName::from_static("x-route-country");
@@ -93,7 +104,10 @@ struct Worker {
     base: String,
     /// Held only for a read or a swap, never across an await.
     slot: RwLock<Slot>,
-    /// Whether the last look at the Runtime found it answering, to spot it coming back.
+    /// Held for the whole of a refresh, so two of them (the timer and a Runtime coming back
+    /// ready) cannot finish out of order and put an older filter over a newer one.
+    refreshing: tokio::sync::Mutex<()>,
+    /// What the last `/readyz` said, to spot the Runtime coming back. Only `/readyz` writes it.
     ready: AtomicBool,
 }
 
@@ -159,6 +173,7 @@ impl RouteState {
             let worker = Worker {
                 base: url.trim_end_matches('/').to_string(),
                 slot: RwLock::default(),
+                refreshing: tokio::sync::Mutex::new(()),
                 ready: AtomicBool::new(false),
             };
             if country.is_empty() || map.insert(country.clone(), worker).is_some() {
@@ -224,14 +239,13 @@ impl RouteState {
         let Some(worker) = self.workers.get(country) else {
             return;
         };
+        let _refreshing = worker.refreshing.lock().await;
         let etag = worker.slot.read().expect("filter slot").etag.clone();
         let url = format!("{}/routing-filter", worker.base);
         let answer = self.fetch(&url, etag.as_deref(), FILTER_TIMEOUT).await;
         let Some(answer) = answer.filter(|answer| !answer.status.is_server_error()) else {
-            worker.ready.store(false, Ordering::Release);
             return;
         };
-        worker.ready.store(true, Ordering::Release);
         let slot = match answer.status {
             StatusCode::NOT_MODIFIED => return,
             StatusCode::OK => {
@@ -278,33 +292,43 @@ impl RouteState {
         tokio::spawn(async move { state.refresh_worker(&country).await });
     }
 
-    /// The only country whose filter can hold `key`.
+    /// Whether some Runtime has no filter now: down at startup, a Pack without one, or one this
+    /// build cannot read.
+    fn any_without_filter(&self) -> bool {
+        self.workers
+            .values()
+            .any(|worker| worker.slot.read().expect("filter slot").filter.is_none())
+    }
+
+    /// The only country whose filter can hold `key`, and whose filter says it does. A Runtime
+    /// without a filter might hold anything, so it blocks a single winner, but it never wins by
+    /// default: when every filter that exists says no, nothing was confirmed.
     fn sole_holder(&self, key: u64) -> Option<String> {
         let mut holders = self
             .workers
             .iter()
-            .filter(|(_, worker)| worker.may_hold(key))
-            .map(|(country, _)| country);
-        let first = holders.next()?;
-        holders.next().is_none().then(|| first.clone())
+            .filter(|(_, worker)| worker.may_hold(key));
+        let (first, worker) = holders.next()?;
+        (holders.next().is_none() && worker.confirms(key)).then(|| first.clone())
     }
 
-    /// Street with town first, then the street alone. Several holders, or none, decide nothing:
-    /// a Runtime is never chosen because another one does not know the street, only because it
-    /// is the one that does.
-    fn decide(&self, street: Option<u64>, town: Option<u64>) -> Decision {
-        let Some(street) = street else {
-            return Decision::Fanout;
-        };
-        if let Some(town) = town
-            && let Some(country) = self.sole_holder(pair_hash(street, town))
-        {
-            return Decision::StreetTown(country);
+    /// For each reading of the street, street with town first, then (when `street_alone`) the
+    /// street alone. Several holders, or none, decide nothing: a Runtime is never chosen because
+    /// another one does not know the street, only because it is the one that does.
+    fn decide(&self, keys: &RouteKeys) -> Decision {
+        for &street in &keys.streets {
+            if let Some(town) = keys.town
+                && let Some(country) = self.sole_holder(pair_hash(street, town))
+            {
+                return Decision::StreetTown(country);
+            }
+            if keys.street_alone
+                && let Some(country) = self.sole_holder(street)
+            {
+                return Decision::Street(country);
+            }
         }
-        match self.sole_holder(street) {
-            Some(country) => Decision::Street(country),
-            None => Decision::Fanout,
-        }
+        Decision::Fanout
     }
 
     /// One line per Runtime for the startup log.
@@ -344,21 +368,47 @@ fn query_params(raw: Option<&str>) -> (Option<String>, usize) {
 /// decoded routes nowhere: the Runtimes will answer it as the bad request it is.
 type Params = Result<Query<HashMap<String, String>>, QueryRejection>;
 
-/// Hashes of the street (from the `text` parameter) and the town (`locality`) of a request.
-#[derive(Debug, Clone, Copy, Default)]
+/// What a request's text is, which decides how far its street can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// `/geocode`'s `address`: the caller says it is an address.
+    Address,
+    /// `/search`'s `q`: anything. A name with no number could be a place or a POI that is also a
+    /// street somewhere, so alone it only routes with a house number or a `locality`.
+    Query,
+    /// `/autocomplete`'s `q`: what is typed so far. "Broadway" is a street while someone is still
+    /// typing "Broadwater Road", so the street alone never routes, only with a `locality`.
+    Typing,
+}
+
+/// Hashes of the streets (from the `text` parameter) and the town (`locality`) of a request.
+#[derive(Debug, Clone, Default)]
 struct RouteKeys {
-    street: Option<u64>,
+    /// The readings of the street, most likely first.
+    streets: Vec<u64>,
     town: Option<u64>,
+    /// Whether the street alone, without the town, is enough to route.
+    street_alone: bool,
 }
 
 impl RouteKeys {
-    fn new(params: &Params, text: &str) -> Self {
+    fn new(params: &Params, text: &str, source: Source) -> Self {
         let Ok(Query(params)) = params else {
             return Self::default();
         };
+        let text = params.get(text).map(String::as_str).unwrap_or_default();
+        let town = params.get("locality").and_then(|town| town_hash(town));
+        let has_number = text
+            .split_whitespace()
+            .any(|token| token.chars().any(|c| c.is_ascii_digit()));
         Self {
-            street: params.get(text).and_then(|text| query_street_hash(text)),
-            town: params.get("locality").and_then(|town| town_hash(town)),
+            streets: query_street_hashes(text),
+            town,
+            street_alone: match source {
+                Source::Address => true,
+                Source::Query => has_number || town.is_some(),
+                Source::Typing => false,
+            },
         }
     }
 }
@@ -422,52 +472,62 @@ fn merge(answers: Vec<(String, Value)>, key: &str, limit: usize) -> Value {
     json!({ "query": query, key: merged })
 }
 
-/// The one answer of a `/geocode` fan-out. A non-null `result` means the Runtime found the
-/// address and its locality, region and postcode checks passed, so it beats `null` from the
-/// others. Among several, a Runtime whose filter holds the street wins, then the best score.
-/// Returns the body and the country it came from, `None` when every Runtime said null.
-fn pick_geocode(
-    state: &RouteState,
-    answers: Vec<(String, Value)>,
-    street: Option<u64>,
-) -> (Value, Option<String>) {
-    let score = |body: &Value| {
-        body["result"]
-            .get("score")
-            .and_then(Value::as_f64)
-            .unwrap_or(f64::MIN)
-    };
+/// What a `/geocode` fan-out came to.
+enum Picked {
+    /// One Runtime's non-null answer, and its country.
+    One(Value, String),
+    /// Every Runtime said null: the first one's body.
+    Null(Value),
+    /// Several Runtimes found an address and nothing tells them apart; the countries.
+    Ambiguous(Vec<String>),
+}
+
+/// The one answer of a `/geocode` fan-out. A non-null `result` beats `null` from the others. With
+/// several, the Runtimes whose filter holds the street are the ones to believe: if exactly one of
+/// them answered, it wins. Otherwise the request does not say which country it means, and the
+/// raw score of one Pack against another is not evidence of that: a street held by several
+/// countries makes every Runtime answer, and a request with only an address has no locality,
+/// region or postcode for the Runtime to check, so a non-null answer proves little. That is
+/// `Ambiguous`, which the caller turns into `country_required`.
+fn pick_geocode(state: &RouteState, answers: Vec<(String, Value)>, streets: &[u64]) -> Picked {
     let holds = |country: &str| {
-        street.is_some_and(|street| {
-            state
-                .workers
-                .get(country)
-                .is_some_and(|worker| worker.confirms(street))
-        })
+        state
+            .workers
+            .get(country)
+            .is_some_and(|worker| streets.iter().any(|street| worker.confirms(*street)))
     };
-    let best = answers
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, body))| body.get("result").is_some_and(|result| !result.is_null()))
-        .max_by(|(_, (a, a_body)), (_, (b, b_body))| {
-            holds(a)
-                .cmp(&holds(b))
-                .then(score(a_body).total_cmp(&score(b_body)))
-        })
-        .map(|(index, _)| index);
-    match best {
-        Some(index) => {
-            let (country, mut body) = answers.into_iter().nth(index).expect("index in range");
-            tag_country(&mut body, "result", &country);
-            (body, Some(country))
+    let mut found: Vec<(String, Value)> = Vec::new();
+    let mut first_body = None;
+    for (country, body) in answers {
+        if body.get("result").is_some_and(|result| !result.is_null()) {
+            found.push((country, body));
+        } else if first_body.is_none() {
+            first_body = Some(body);
         }
-        None => (
-            answers
-                .into_iter()
-                .next()
-                .map_or(Value::Null, |(_, body)| body),
-            None,
-        ),
+    }
+    if found.len() > 1 {
+        let holders = found.iter().filter(|(country, _)| holds(country)).count();
+        if holders == 1 {
+            found.retain(|(country, _)| holds(country));
+        }
+    }
+    match found.len() {
+        0 => Picked::Null(first_body.unwrap_or(Value::Null)),
+        1 => {
+            let (country, mut body) = found.remove(0);
+            tag_country(&mut body, "result", &country);
+            Picked::One(body, country)
+        }
+        _ => Picked::Ambiguous(found.into_iter().map(|(country, _)| country).collect()),
+    }
+}
+
+/// Whether a Runtime's answer has anything in it: a non-empty list, a non-null result.
+fn has_answer(body: &Value, shape: Shape) -> bool {
+    match body.get(shape.key()) {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
     }
 }
 
@@ -571,7 +631,7 @@ async fn forward_or_merge(
         return forward_to_country(state, path, &suffix, &country, &request_id).await;
     }
 
-    let decision = state.decide(keys.street, keys.town);
+    let decision = state.decide(&keys);
     let routed = match &decision {
         Decision::StreetTown(country) => Some((country, "filter-street-town")),
         Decision::Street(country) => Some((country, "filter-street")),
@@ -588,16 +648,25 @@ async fn forward_or_merge(
                 );
             }
             Some((status, content_type, body)) if status.is_success() => {
-                let response = match serde_json::from_slice::<Value>(&body) {
+                match serde_json::from_slice::<Value>(&body) {
+                    // A filter can be wrong (a false positive, a town spelled another way), and
+                    // an empty answer from the wrong country must not end the search.
+                    Ok(value) if !has_answer(&value, shape) => {}
                     Ok(mut value) => {
                         tag_country(&mut value, shape.key(), country);
-                        axum::Json(value).into_response()
+                        return tagged(axum::Json(value).into_response(), route, Some(country));
                     }
-                    Err(_) => passthrough(status, content_type, body),
-                };
-                return tagged(response, route, Some(country));
+                    Err(_) => {
+                        return tagged(
+                            passthrough(status, content_type, body),
+                            route,
+                            Some(country),
+                        );
+                    }
+                }
             }
-            // The chosen Runtime failed or did not answer: the others may still know the street.
+            // The chosen Runtime failed, did not answer or found nothing: the others may still
+            // know the street.
             _ => {}
         }
     }
@@ -613,14 +682,20 @@ async fn forward_or_merge(
             "fanout",
             None,
         ),
-        Shape::Best => {
-            let (body, country) = pick_geocode(state, answers, keys.street);
-            tagged(
-                axum::Json(body).into_response(),
+        Shape::Best => match pick_geocode(state, answers, &keys.streets) {
+            Picked::One(body, country) => {
+                tagged(axum::Json(body).into_response(), "fanout", Some(&country))
+            }
+            Picked::Null(body) => tagged(axum::Json(body).into_response(), "fanout", None),
+            Picked::Ambiguous(countries) => tagged(
+                with_id(
+                    Problem::country_ambiguous("/geocode", &countries),
+                    &request_id,
+                ),
                 "fanout",
-                country.as_deref(),
-            )
-        }
+                None,
+            ),
+        },
     }
 }
 
@@ -630,7 +705,7 @@ async fn search(
     RawQuery(raw): RawQuery,
     params: Params,
 ) -> Response {
-    let keys = RouteKeys::new(&params, "q");
+    let keys = RouteKeys::new(&params, "q", Source::Query);
     forward_or_merge(
         &state,
         "/search",
@@ -648,7 +723,7 @@ async fn autocomplete(
     RawQuery(raw): RawQuery,
     params: Params,
 ) -> Response {
-    let keys = RouteKeys::new(&params, "q");
+    let keys = RouteKeys::new(&params, "q", Source::Typing);
     forward_or_merge(
         &state,
         "/autocomplete",
@@ -668,7 +743,7 @@ async fn geocode(
     RawQuery(raw): RawQuery,
     params: Params,
 ) -> Response {
-    let keys = RouteKeys::new(&params, "address");
+    let keys = RouteKeys::new(&params, "address", Source::Address);
     forward_or_merge(&state, "/geocode", Shape::Best, raw, keys, request_id).await
 }
 
@@ -737,22 +812,25 @@ pub async fn route(options: RouteOptions) -> Result<()> {
     let listener = TcpListener::bind(options.bind)
         .await
         .with_context(|| format!("failed to bind {}", options.bind))?;
-    // Best effort: a Runtime that is down now is simply "might hold anything" until it is back.
-    state.refresh_filters().await;
-    println!("{}", state.filter_summary());
-    if !options.filter_refresh.is_zero() {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(options.filter_refresh);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick is immediate and the startup fetch has just run.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                state.refresh_filters().await;
-            }
-        });
-    }
+    // The listener comes up first: a Runtime that is slow or down now only means "might hold
+    // anything" until its filter arrives.
+    let refresh = options.filter_refresh;
+    let background = state.clone();
+    tokio::spawn(async move {
+        background.refresh_filters().await;
+        println!("{}", background.filter_summary());
+        // Zero turns the timer off.
+        while !refresh.is_zero() {
+            // A Runtime without a filter is asked again soon: it may only have been starting.
+            let wait = if background.any_without_filter() {
+                refresh.min(FILTER_RETRY)
+            } else {
+                refresh
+            };
+            tokio::time::sleep(wait).await;
+            background.refresh_filters().await;
+        }
+    });
     axum::serve(listener, build_router(state))
         .await
         .context("router failed")
@@ -760,7 +838,7 @@ pub async fn route(options: RouteOptions) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU16, AtomicUsize};
+    use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize};
 
     use xxhash_rust::xxh3::xxh3_64;
 
@@ -785,6 +863,8 @@ mod tests {
         fail_with: Arc<AtomicU16>,
         /// Make /routing-filter answer 500.
         filter_broken: Arc<AtomicBool>,
+        /// Milliseconds /routing-filter waits after it has read its bytes, before it answers.
+        filter_delay: Arc<AtomicU64>,
     }
 
     impl Fake {
@@ -808,6 +888,7 @@ mod tests {
             not_modified: Arc::default(),
             fail_with: Arc::default(),
             filter_broken: Arc::default(),
+            filter_delay: Arc::default(),
         };
         let answer = |fake: &Fake, body: Value| {
             let (hits, fail_with) = (fake.hits.clone(), fake.fail_with.clone());
@@ -835,6 +916,10 @@ mod tests {
                     let Some(bytes) = fake.filter.read().unwrap().clone() else {
                         return StatusCode::NOT_FOUND.into_response();
                     };
+                    let delay = fake.filter_delay.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     let etag = format!("\"{:016x}\"", xxh3_64(&bytes));
                     let mut response = if headers
                         .get(header::IF_NONE_MATCH)
@@ -966,6 +1051,15 @@ mod tests {
         (header(&ROUTE_HEADER), header(&ROUTE_COUNTRY_HEADER))
     }
 
+    /// The keys of a request that names this street, and maybe a town.
+    fn keys(street: &str, town: Option<&str>, street_alone: bool) -> RouteKeys {
+        RouteKeys {
+            streets: vec![street_hash(street).expect("street")],
+            town: town.map(|town| town_hash(town).expect("town")),
+            street_alone,
+        }
+    }
+
     /// Three countries that share the street "King Street" and hold others alone.
     struct Countries {
         base: String,
@@ -1093,7 +1187,8 @@ mod tests {
     #[tokio::test]
     async fn a_street_and_town_held_by_one_country_routes_there() {
         let nz_hit = json!({ "label": "15 Eruera Street, Rotorua", "score": 9.0 });
-        let c = countries([Value::Null, nz_hit, Value::Null]).await;
+        let au_hit = json!({ "label": "12 King Street, Sydney", "score": 9.0 });
+        let c = countries([au_hit, nz_hit, Value::Null]).await;
 
         let (status, headers, body) = get_full(&format!(
             "{}/geocode?address=15+Eruera+Street&locality=Rotorua",
@@ -1117,7 +1212,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_street_held_by_one_country_routes_there_without_a_town() {
-        let c = countries([Value::Null, Value::Null, Value::Null]).await;
+        let hit = json!({ "label": "1 George Street", "score": 1.0 });
+        let c = countries([hit, Value::Null, Value::Null]).await;
 
         // The town is held nowhere, but the street only by AU.
         for query in [
@@ -1158,6 +1254,7 @@ mod tests {
     async fn search_and_autocomplete_route_by_the_street_of_the_query() {
         let c = countries([Value::Null, Value::Null, Value::Null]).await;
 
+        // With a town, both route on street and town.
         for path in ["search", "autocomplete"] {
             let key = if path == "search" {
                 "results"
@@ -1177,16 +1274,12 @@ mod tests {
             );
             assert_eq!(body[key][0]["label"], "nz");
             assert_eq!(body[key][0]["country"], "NZ", "{path}");
-
-            // A bare street name, without a number, is a street too.
-            let (_, headers, _) = get_full(&format!("{}/{path}?q=George+Street", c.base)).await;
-            assert_eq!(
-                route_of(&headers),
-                (Some("filter-street"), Some("AU")),
-                "{path}"
-            );
         }
-        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (2, 2, 0));
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (0, 2, 0));
+
+        // A search with a house number routes on the street alone.
+        let (_, headers, _) = get_full(&format!("{}/search?q=1+George+Street", c.base)).await;
+        assert_eq!(route_of(&headers), (Some("filter-street"), Some("AU")));
 
         // The same street in three countries merges by score as before, every item tagged.
         let (_, headers, body) = get_full(&format!("{}/search?q=1+King+St", c.base)).await;
@@ -1201,10 +1294,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_that_may_be_a_place_or_half_a_word_does_not_route_on_the_street_alone() {
+        let c = countries([Value::Null, Value::Null, Value::Null]).await;
+
+        // Only AU holds George Street, but a name with no number may be a place, and "George
+        // Street" typed so far may be the start of another street, so these ask everyone.
+        for query in [
+            "search?q=George+Street",
+            "autocomplete?q=George+Street",
+            "autocomplete?q=15+George+Street",
+        ] {
+            let (_, headers, _) = get_full(&format!("{}/{query}", c.base)).await;
+            assert_eq!(route_of(&headers).0, Some("fanout"), "{query}");
+        }
+        // A town makes the name an address, in the one place that has it.
+        let (_, headers, _) = get_full(&format!(
+            "{}/search?q=George+Street&locality=Sydney",
+            c.base
+        ))
+        .await;
+        assert_eq!(route_of(&headers), (Some("filter-street-town"), Some("AU")));
+        // Sydney has no Eruera Street, so a search names the street alone, in NZ only.
+        let (_, headers, _) = get_full(&format!(
+            "{}/search?q=Eruera+Street&locality=Sydney",
+            c.base
+        ))
+        .await;
+        assert_eq!(route_of(&headers), (Some("filter-street"), Some("NZ")));
+    }
+
+    #[tokio::test]
     async fn a_runtime_without_a_usable_filter_might_hold_anything() {
         let street = filter_of(&[("Eruera Street", &["Rotorua"])]);
         let query = "address=15+Eruera+Street&locality=Rotorua";
-        let holds = fake(json!([]), Value::Null, Some(street.clone()), StatusCode::OK).await;
+        let hit = json!({ "label": "15 Eruera Street", "score": 1.0 });
+        let holds = fake(json!([]), hit, Some(street.clone()), StatusCode::OK).await;
         let none = fake(json!([]), Value::Null, None, StatusCode::OK).await;
         let bogus = fake(
             json!([]),
@@ -1232,10 +1356,18 @@ mod tests {
             let (_, headers, _) = get_full(&format!("{base}/geocode?{query}")).await;
             assert_eq!(route_of(&headers).0, Some("fanout"));
         }
+
+        // And it does not win by default either: when every filter that exists says no, nothing
+        // confirmed the street, so the request is not called routed.
+        for unknown in [&none, &bogus] {
+            let base = router(vec![("NZ", other.url.clone()), ("AU", unknown.url.clone())]).await;
+            let (_, headers, _) = get_full(&format!("{base}/geocode?{query}")).await;
+            assert_eq!(route_of(&headers).0, Some("fanout"));
+        }
     }
 
     #[tokio::test]
-    async fn geocode_fan_out_picks_the_runtime_that_found_the_address() {
+    async fn geocode_fan_out_picks_the_one_runtime_that_found_the_address() {
         let hit = |score: f64| json!({ "label": "somewhere", "score": score });
 
         // Exactly one non-null answer wins, whatever the others said.
@@ -1252,13 +1384,18 @@ mod tests {
         assert_eq!(route_of(&headers), (Some("fanout"), None));
         assert!(body["result"].is_null());
 
-        // Several: the highest score, among the Runtimes whose filter holds the street.
+        // Several, all holding the street: nothing tells them apart, and the score of one Pack
+        // against another's is not evidence, so the caller is asked for a country.
         let c = countries([hit(2.0), hit(9.0), hit(5.0)]).await;
-        let (_, _, body) = get_full(&format!("{}/geocode?address=1+King+St", c.base)).await;
-        assert_eq!(body["result"]["country"], "NZ");
+        let (status, headers, body) =
+            get_full(&format!("{}/geocode?address=1+King+St", c.base)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(route_of(&headers), (Some("fanout"), None));
+        assert_eq!(body["error_code"], "country_required");
+        assert!(body["detail"].as_str().unwrap().contains("AU, CA, NZ"));
 
-        // A Runtime whose filter holds the street beats a higher score from one that has no
-        // filter and so proves nothing.
+        // Of two answers, the one from the Runtime whose filter holds the street is believed over
+        // one from a Runtime that has no filter and so proves nothing, whatever their scores.
         let holder = fake(
             json!([]),
             hit(1.0),
@@ -1302,6 +1439,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_routed_runtime_with_nothing_to_say_falls_back_to_every_runtime() {
+        let hit = json!({ "label": "found", "score": 1.0 });
+        // The filters name NZ for Eruera Street in Rotorua, but NZ finds nothing (a filter false
+        // positive, or a town spelled another way) and AU does.
+        let c = countries([hit, Value::Null, Value::Null]).await;
+        let (status, headers, body) = get_full(&format!(
+            "{}/geocode?address=15+Eruera+Street&locality=Rotorua",
+            c.base
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(route_of(&headers), (Some("fanout"), Some("AU")));
+        assert_eq!(body["result"]["label"], "found");
+        // NZ was asked twice: as the routed Runtime, then again with the others.
+        assert_eq!((c.au.hits(), c.nz.hits(), c.ca.hits()), (1, 2, 1));
+
+        // Lists too: NZ answers an empty list, AU has results.
+        let nz = fake(
+            json!([]),
+            Value::Null,
+            Some(filter_of(&[("Eruera Street", &["Rotorua"])])),
+            StatusCode::OK,
+        )
+        .await;
+        let au = fake(
+            json!([{ "label": "au", "score": 1.0 }]),
+            Value::Null,
+            Some(filter_of(&[("Elm Street", &[])])),
+            StatusCode::OK,
+        )
+        .await;
+        let base = router(vec![("NZ", nz.url.clone()), ("AU", au.url.clone())]).await;
+        let (_, headers, body) = get_full(&format!(
+            "{base}/search?q=15+Eruera+Street&locality=Rotorua"
+        ))
+        .await;
+        assert_eq!(route_of(&headers).0, Some("fanout"));
+        assert_eq!(body["results"][0]["country"], "AU");
+    }
+
+    #[tokio::test]
     async fn a_client_error_is_passed_through_routed_or_not() {
         let c = countries([Value::Null, Value::Null, Value::Null]).await;
 
@@ -1323,8 +1501,6 @@ mod tests {
 
     #[tokio::test]
     async fn refreshing_picks_up_a_swapped_filter_and_a_304_keeps_the_held_one() {
-        let street = street_hash("Eruera Street").expect("street");
-        let town = town_hash("Rotorua").expect("town");
         let nz = fake(
             json!([]),
             Value::Null,
@@ -1341,23 +1517,32 @@ mod tests {
         .await;
         let (_, state) = router_state(vec![("NZ", nz.url.clone()), ("AU", au.url.clone())]).await;
         let nz_decision = Decision::StreetTown("NZ".to_string());
-        assert_eq!(state.decide(Some(street), Some(town)), nz_decision);
+        assert_eq!(
+            state.decide(&keys("Eruera Street", Some("Rotorua"), true)),
+            nz_decision
+        );
         assert_eq!(nz.sent.load(Ordering::SeqCst), 1);
 
         // Nothing changed: the Runtime answers 304 and the filter stays.
         state.refresh_filters().await;
         assert_eq!(nz.sent.load(Ordering::SeqCst), 1);
         assert_eq!(nz.not_modified.load(Ordering::SeqCst), 1);
-        assert_eq!(state.decide(Some(street), Some(town)), nz_decision);
+        assert_eq!(
+            state.decide(&keys("Eruera Street", Some("Rotorua"), true)),
+            nz_decision
+        );
 
         // The Pack is swapped: the street now lives in AU. Until a refresh the router still
         // believes the old filter.
         *nz.filter.write().unwrap() = Some(filter_of(&[("Elm Street", &[])]));
         *au.filter.write().unwrap() = Some(filter_of(&[("Eruera Street", &["Rotorua"])]));
-        assert_eq!(state.decide(Some(street), Some(town)), nz_decision);
+        assert_eq!(
+            state.decide(&keys("Eruera Street", Some("Rotorua"), true)),
+            nz_decision
+        );
         state.refresh_filters().await;
         assert_eq!(
-            state.decide(Some(street), Some(town)),
+            state.decide(&keys("Eruera Street", Some("Rotorua"), true)),
             Decision::StreetTown("AU".to_string())
         );
 
@@ -1366,20 +1551,20 @@ mod tests {
         au.filter_broken.store(true, Ordering::SeqCst);
         state.refresh_filters().await;
         assert_eq!(
-            state.decide(Some(street), Some(town)),
+            state.decide(&keys("Eruera Street", Some("Rotorua"), true)),
             Decision::StreetTown("AU".to_string())
         );
-        assert!(!state.workers["AU"].ready.load(Ordering::SeqCst));
         au.filter_broken.store(false, Ordering::SeqCst);
         *au.filter.write().unwrap() = None;
         state.refresh_filters().await;
-        let elm = street_hash("Elm Street").expect("street");
-        assert_eq!(state.decide(Some(elm), None), Decision::Fanout);
+        assert_eq!(
+            state.decide(&keys("Elm Street", None, true)),
+            Decision::Fanout
+        );
     }
 
     #[tokio::test]
     async fn a_runtime_coming_back_ready_has_its_filter_fetched_again() {
-        let street = street_hash("Eruera Street").expect("street");
         let nz = fake(
             json!([]),
             Value::Null,
@@ -1396,9 +1581,14 @@ mod tests {
         .await;
         let (base, state) =
             router_state(vec![("NZ", nz.url.clone()), ("AU", au.url.clone())]).await;
-        assert_eq!(state.decide(Some(street), None), Decision::Fanout);
+        assert_eq!(
+            state.decide(&keys("Eruera Street", None, true)),
+            Decision::Fanout
+        );
 
-        // NZ goes down for a Pack swap, and the router notices through /readyz.
+        // The router sees both ready, then NZ goes down for a Pack swap.
+        let (status, _) = get(&format!("{base}/readyz")).await;
+        assert_eq!(status, StatusCode::OK);
         nz.ready.store(503, Ordering::SeqCst);
         let (status, _) = get(&format!("{base}/readyz")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1411,12 +1601,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let mut decision = Decision::Fanout;
         for _ in 0..100 {
-            decision = state.decide(Some(street), None);
+            decision = state.decide(&keys("Eruera Street", None, true));
             if decision != Decision::Fanout {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(decision, Decision::Street("NZ".to_string()));
+    }
+
+    #[tokio::test]
+    async fn refreshes_that_overlap_cannot_leave_the_older_filter_behind() {
+        let nz = fake(
+            json!([]),
+            Value::Null,
+            Some(filter_of(&[("Elm Street", &[])])),
+            StatusCode::OK,
+        )
+        .await;
+        let au = fake(
+            json!([]),
+            Value::Null,
+            Some(filter_of(&[("Elm Street", &[])])),
+            StatusCode::OK,
+        )
+        .await;
+        let (_, state) = router_state(vec![("NZ", nz.url.clone()), ("AU", au.url.clone())]).await;
+        let at_nz = keys("Eruera Street", None, true);
+        assert_eq!(state.decide(&at_nz), Decision::Fanout);
+
+        // The first refresh reads the filter as it is now (one without the street) and is slow to
+        // deliver it. Meanwhile the Pack is swapped and a second refresh asks, and would be done
+        // first.
+        let old = filter_of(&[("Elm Street", &[]), ("Oak Street", &[])]);
+        *nz.filter.write().unwrap() = Some(old);
+        nz.filter_delay.store(300, Ordering::SeqCst);
+        let slow = {
+            let state = state.clone();
+            tokio::spawn(async move { state.refresh_worker("NZ").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        *nz.filter.write().unwrap() = Some(filter_of(&[("Eruera Street", &[])]));
+        nz.filter_delay.store(0, Ordering::SeqCst);
+        state.refresh_worker("NZ").await;
+        slow.await.expect("refresh");
+
+        // The newer filter wins however the two finished.
+        assert_eq!(state.decide(&at_nz), Decision::Street("NZ".to_string()));
     }
 }

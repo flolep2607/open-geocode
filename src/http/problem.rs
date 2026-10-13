@@ -160,6 +160,14 @@ impl Problem {
             .with_detail(format!("{route} needs a country parameter"))
     }
 
+    /// A request without `country` that several countries answer and nothing tells apart.
+    pub(crate) fn country_ambiguous(route: &str, countries: &[String]) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "country_required").with_detail(format!(
+            "{route} found this address in {}; add a country parameter to choose",
+            countries.join(", ")
+        ))
+    }
+
     /// A Runtime behind the router did not answer.
     pub(crate) fn upstream_unavailable(country: &str) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "upstream_unavailable")

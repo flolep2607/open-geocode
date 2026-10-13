@@ -971,48 +971,74 @@ mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    #[tokio::test]
-    async fn a_pack_without_a_routing_filter_answers_a_404_problem() {
-        use crate::record::{PlaceLayer, PlaceRecord, Record};
+    /// Rewrite the Pack's file with its routing filter section dropped (`None`, a Pack built before
+    /// the section existed) or filed under another `version` (one from a newer build).
+    fn rewrite_routing_filter(dir: &Path, version: Option<u32>) {
+        use crate::{
+            container::{Container, ContainerWriter},
+            pack::PACK_FILE,
+            street_filter::ROUTING_FILTER_SECTION,
+        };
 
-        let pack = temp_path("no-routing-filter");
-        let _ = std::fs::remove_dir_all(&pack);
-        let mut writer = PackWriter::create(&pack).expect("writer");
-        writer
-            .write(
-                &Record::Place(
-                    PlaceLayer::Locality,
-                    PlaceRecord {
-                        name: "Rotorua".to_string(),
-                        place_type: "city".to_string(),
-                        geometry: crate::record::point_geometry(176.25, -38.14),
-                        source: SourceProvenance::osm(OsmObjectType::Relation, 7),
-                    },
-                ),
-                None,
-            )
-            .expect("place");
+        let id = std::fs::read_to_string(dir.join("CURRENT")).expect("pointer");
+        let file = dir.join("generations").join(id.trim()).join(PACK_FILE);
+        let old = Container::open(&file).expect("open");
+        let rewritten = file.with_extension("rewritten");
+        let mut writer = ContainerWriter::create(&rewritten).expect("create");
+        for (name, info) in old.sections() {
+            let bytes = old.raw_section(name).expect("section");
+            if name == ROUTING_FILTER_SECTION {
+                let Some(version) = version else { continue };
+                writer.add(name, version, bytes.as_slice()).expect("add");
+            } else {
+                writer
+                    .add(name, info.version, bytes.as_slice())
+                    .expect("add");
+            }
+        }
         writer.finish().expect("finish");
-        let demo = temp_path("no-routing-filter-demo");
-        let no_basemap = temp_path("no-routing-filter-no-basemap");
-        let router = build_router(state_for(&pack, true), &demo, &no_basemap);
+        drop(old);
+        std::fs::rename(&rewritten, &file).expect("replace");
+    }
 
-        let mut tagged = request("GET", "/routing-filter");
-        tagged
-            .headers_mut()
-            .insert("cf-ray", header::HeaderValue::from_static("ray-filter-1"));
-        let reply = send(router, tagged).await;
-        assert_eq!(reply.status, StatusCode::NOT_FOUND);
-        assert_eq!(reply.content_type(), "application/problem+json");
-        assert_eq!(reply.json()["error_code"], "not_found");
-        assert_eq!(reply.json()["request_id"], "ray-filter-1");
-        assert!(
-            reply.json()["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("routing filter"))
-        );
+    #[tokio::test]
+    async fn a_pack_without_a_usable_routing_filter_answers_a_404_problem_and_still_serves() {
+        // An old Pack has no section; a newer build's Pack has one this build cannot read. Both
+        // open, serve /search, and leave the router to treat them as "might hold anything".
+        for (name, version) in [("old", None), ("newer", Some(2))] {
+            let pack = temp_path(&format!("no-routing-filter-{name}"));
+            write_pack(&pack);
+            rewrite_routing_filter(&pack, version);
+            let demo = temp_path(&format!("no-routing-filter-{name}-demo"));
+            let no_basemap = temp_path(&format!("no-routing-filter-{name}-no-basemap"));
+            let router = build_router(state_for(&pack, true), &demo, &no_basemap);
 
-        let _ = std::fs::remove_dir_all(&pack);
+            let mut tagged = request("GET", "/routing-filter");
+            tagged
+                .headers_mut()
+                .insert("cf-ray", header::HeaderValue::from_static("ray-filter-1"));
+            let reply = send(router.clone(), tagged).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{name}");
+            assert_eq!(reply.content_type(), "application/problem+json");
+            assert_eq!(reply.json()["error_code"], "not_found");
+            assert_eq!(reply.json()["request_id"], "ray-filter-1");
+            assert!(
+                reply.json()["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("routing filter"))
+            );
+
+            let reply = send(router, request("GET", "/search?q=king+street")).await;
+            assert_eq!(reply.status, StatusCode::OK, "{name}");
+            assert!(
+                !reply.json()["results"]
+                    .as_array()
+                    .expect("results")
+                    .is_empty()
+            );
+
+            let _ = std::fs::remove_dir_all(&pack);
+        }
     }
 
     #[tokio::test]

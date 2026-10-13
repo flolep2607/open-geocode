@@ -561,7 +561,7 @@ mod tests {
         search::{PackTextSearcher, TextSearchOptions},
         street_filter::{
             ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION, RoutingFilter, pair_hash,
-            query_street_hash, street_hash, town_hash,
+            query_street_hashes, street_hash, town_hash,
         },
     };
 
@@ -985,7 +985,11 @@ mod tests {
         assert_eq!(address.address.postcode.as_deref(), Some("M5T 9Z9"));
         // Imported rows are keyed like OSM ones: the street of a typed address finds them.
         let filter = routing_filter(&reader);
-        assert!(filter.maybe_contains(query_street_hash("12 Spadina Ave").unwrap()));
+        assert!(
+            query_street_hashes("12 Spadina Ave")
+                .into_iter()
+                .any(|key| filter.maybe_contains(key))
+        );
         assert!(holds_street_in(&filter, "Spadina Avenue", "Toronto"));
         let context = reader
             .boundary_context(row)

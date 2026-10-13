@@ -17,12 +17,19 @@
 //! positives). It never has false negatives, so a Pack that holds a street always says so.
 //!
 //! ```text
-//! 0    magic "OGRF" | format u8 (1 = BinaryFuse8) | shard_bits u8 | reserved u16 | key_seed u64
+//! 0    magic "OGRF" | format u8 (1 = BinaryFuse8) | shard_bits u8 | key_scheme u16 | key_seed u64
 //! 16   shard blobs, back to back: xorf descriptor (20 bytes) | fingerprints
 //! ...  shard table: 1 << shard_bits entries of (offset u64 from the section start, len u64);
 //!      len 0 is an empty shard
 //! end  unique key count u64 (diagnostics)
 //! ```
+//!
+//! `key_scheme` names the rules that turn a street into a key (`normalize_index_text`,
+//! `expand_address_abbreviations`, the hash above). The builder and the router are different
+//! binaries, so a router built with other rules would hash the same street to other bytes and a
+//! Pack that holds it would stop saying so. A reader refuses a filter of another scheme, and
+//! [`KEY_SCHEME`] is bumped with any change to those rules; `key_scheme_is_pinned` fails when one
+//! changes without it.
 //!
 //! Keys are sharded by their top hash bits so a planet build constructs one bounded shard at a time
 //! (xorf needs its keys in memory). The offsets live in a trailer so the writer never seeks.
@@ -40,7 +47,10 @@ use crate::{
     memory::{MemoryBudget, Reservation},
     pack::RecordId,
     record::{PlaceLayer, Record},
-    search::{expand_address_abbreviations, street_fallback_query, strip_unit_terms},
+    search::{
+        expand_address_abbreviations, is_house_number_token, street_fallback_query,
+        strip_unit_terms,
+    },
     text_index::normalize_index_text,
     util::codec::read_u64_le,
 };
@@ -48,6 +58,9 @@ use crate::{
 /// Never named `text/...`: the text index loads every section with that prefix.
 pub(crate) const ROUTING_FILTER_SECTION: &str = "routing/filter";
 pub(crate) const ROUTING_FILTER_VERSION: u32 = 1;
+/// Bump with any change to `normalize_index_text`, `expand_address_abbreviations`, the hashes or
+/// the keys a record gives; see the module docs.
+pub(crate) const KEY_SCHEME: u16 = 1;
 
 /// Fixed forever and stored in the header, so a reader can refuse a filter hashed another way.
 pub(crate) const ROUTING_SEED: u64 = 0x6f67_726f_7574_6531;
@@ -92,19 +105,35 @@ pub(crate) fn pair_hash(street: u64, town: u64) -> u64 {
     xxh3_64_with_seed(&bytes, ROUTING_SEED ^ PAIR_SALT)
 }
 
-/// The street of an address typed by a person: unit terms, house number and what precedes it are
-/// dropped. A bare street ("Peacock St") has no number to drop and is taken whole.
+/// The streets an address typed by a person can name, most likely first, as hashes. Unit terms and
+/// the house number are dropped. Two readings, because text before the number is either noise
+/// ("Level 3, 100 George St") or part of the name ("Highway 6 North"), and nothing in the text
+/// says which:
 ///
-/// The number goes before abbreviations are expanded on purpose: the `st` rule depends on a
-/// non-numeric previous token, so "12 St Kilda Rd" gives the same "st kilda road" as the stored
-/// street. A numeric street name ("12 10 Mile Road") loses its 10 and finds no holder, which only
-/// sends the request to every Pack.
-pub(crate) fn query_street_hash(text: &str) -> Option<u64> {
-    let street = street_fallback_query(text).or_else(|| {
-        let expanded = expand_address_abbreviations(&normalize_index_text(text)?);
-        strip_unit_terms(&expanded)
-    })?;
-    street_hash(&street)
+/// 1. the text from its first non-number token: it keeps "Highway 6 North" whole, and drops the
+///    number of "12A St Kilda Rd" before "St" is read as "Street";
+/// 2. what follows the first number, which drops "Level 3" and "Lot 5" too.
+///
+/// A bare street ("Peacock St") has no number to drop and is taken whole. A numeric street name
+/// ("12 10 Mile Road") loses its 10 and finds no holder, which only sends the request to every
+/// Pack.
+pub(crate) fn query_street_hashes(text: &str) -> Vec<u64> {
+    let leading = normalize_index_text(text)
+        .and_then(|normalized| strip_unit_terms(&normalized))
+        .map(|stripped| {
+            stripped
+                .split_whitespace()
+                .skip_while(|token| is_house_number_token(token))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let mut hashes: Vec<u64> = [leading, street_fallback_query(text)]
+        .into_iter()
+        .flatten()
+        .filter_map(|street| street_hash(&street))
+        .collect();
+    hashes.dedup();
+    hashes
 }
 
 /// Names of the boundary places a context tuple points at, by record id. The tuple holds ids, not
@@ -227,7 +256,7 @@ impl<W: Write> FilterEncoder<W> {
         );
         out.write_all(MAGIC)?;
         out.write_all(&[FORMAT_BINARY_FUSE8, shard_bits])?;
-        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(&KEY_SCHEME.to_le_bytes())?;
         out.write_all(&ROUTING_SEED.to_le_bytes())?;
         Ok(Self {
             out,
@@ -366,12 +395,11 @@ impl RoutingKeyWriter {
         Ok(())
     }
 
-    /// Write the section, or nothing when no record had a street.
+    /// Write the section. A Pack without a single street gets an empty filter, which says it holds
+    /// nothing; only a Pack built before the section existed has none, and the router treats that
+    /// one as holding anything.
     pub(crate) fn finish(self, pack: &mut ContainerWriter) -> Result<RoutingCommit> {
         let stats = self.keys.stats();
-        if stats.items == 0 {
-            return Ok(RoutingCommit::default());
-        }
         let shard_bits = shard_bits_for(stats.items);
         let sorted = self.keys.finish()?.map(|key| key.map(|(key,)| key));
         pack.begin(ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION)?;
@@ -418,6 +446,11 @@ impl<B: AsRef<[u8]>> RoutingFilter<B> {
         ensure!(
             shard_bits <= MAX_SHARD_BITS,
             "routing filter shard_bits {shard_bits} is out of range"
+        );
+        let scheme = u16::from_le_bytes([data[6], data[7]]);
+        ensure!(
+            scheme == KEY_SCHEME,
+            "routing filter uses key scheme {scheme}, this build uses {KEY_SCHEME}"
         );
         let seed = read_u64_le(data, 8).context("routing filter is truncated")?;
         if seed != ROUTING_SEED {
@@ -495,7 +528,18 @@ fn validate_descriptor(blob: &[u8]) -> Result<()> {
         segment_length.is_power_of_two() && mask == segment_length - 1,
         "descriptor segment length is not a power of two"
     );
+    // A lookup reads at `h0 + 2 * segment_length` plus a mask below the segment length, with `h0`
+    // below `segments`; only whole segments keep that inside `segments + 2 * segment_length`. xorf
+    // adds in u32, so the sum has to fit one.
+    ensure!(
+        segments > 0 && segments % segment_length == 0,
+        "descriptor segments are not a whole number of segments"
+    );
     let needed = u64::from(segments) + 2 * u64::from(segment_length);
+    ensure!(
+        needed <= u64::from(u32::MAX),
+        "descriptor is larger than a u32 lookup can index"
+    );
     ensure!(
         (blob.len() - DESCRIPTOR_BYTES) as u64 >= needed,
         "fingerprints are shorter than the descriptor needs"
@@ -546,10 +590,13 @@ mod tests {
         .0
     }
 
+    /// Every reading of `text` is a key; the stored street must be among them.
+    fn query_holds(text: &str, stored: &str) -> bool {
+        query_street_hashes(text).contains(&street_hash(stored).expect("stored street"))
+    }
+
     #[test]
     fn query_and_stored_streets_hash_alike() {
-        let street = |text: &str| street_hash(text).expect("street");
-        let query = |text: &str| query_street_hash(text).expect("query");
         for text in [
             "12a King St",
             "3/12 King St",
@@ -559,17 +606,101 @@ mod tests {
             "KING STREET",
             "King St",
         ] {
-            assert_eq!(query(text), street("King Street"), "{text}");
+            assert!(query_holds(text, "King Street"), "{text}");
         }
-        assert_eq!(query("12 St Kilda Rd"), street("St Kilda Road"));
-        assert_eq!(query("St Kilda Rd"), street("St Kilda Road"));
-        assert_eq!(query("15 Eruera Street"), street("Eruera Street"));
-        assert_eq!(query("12 BARRINGER STREET"), street("Barringer St"));
-        assert_eq!(query("12 Main St E"), street("Main Street East"));
-        assert_eq!(query("14 8th Street"), street("8th Street"));
-        assert_ne!(query("12 King Street"), query("12 Queen Street"));
-        assert_eq!(query_street_hash(""), None);
+        assert!(query_holds("12 St Kilda Rd", "St Kilda Road"));
+        assert!(query_holds("St Kilda Rd", "St Kilda Road"));
+        assert!(query_holds("15 Eruera Street", "Eruera Street"));
+        assert!(query_holds("12 BARRINGER STREET", "Barringer St"));
+        assert!(query_holds("12 Main St E", "Main Street East"));
+        assert!(query_holds("14 8th Street", "8th Street"));
+        assert!(!query_holds("12 King Street", "Queen Street"));
+        assert!(query_street_hashes("").is_empty());
+        assert!(query_street_hashes("15").is_empty());
         assert_eq!(street_hash("  --  "), None);
+    }
+
+    /// A street typed with a number in front, or a name that holds a number, must not drift from
+    /// the stored street: a drift is a false negative, and a false negative misroutes.
+    #[test]
+    fn query_streets_do_not_drift_from_stored_streets() {
+        let streets = [
+            "King Street",
+            "St Kilda Road",
+            "St John St",
+            "Highway 6 North",
+            "State Highway 1 South",
+            "Number 1 Road",
+            "8th Street",
+            "5th Ave",
+            "Main St E",
+            "Peacock St",
+            "Queen Street",
+            "Māori Road",
+            "Église Street",
+        ];
+        let prefixes = [
+            "",
+            "12 ",
+            "12A ",
+            "12-14 ",
+            "12a-14b ",
+            "2/172 ",
+            "3/12 ",
+            "U3/12 ",
+            "Unit 3, 12 ",
+            "Unit 3 12 ",
+            "Flat 4, 8 ",
+            "Suite 400, 5 ",
+            "Level 2, 100 ",
+            "Shop 2, 15 ",
+            "Lot 5 ",
+            "Building B, 12 ",
+        ];
+        for street in streets {
+            for prefix in prefixes {
+                let text = format!("{prefix}{street}");
+                assert!(query_holds(&text, street), "{text:?} against {street:?}");
+            }
+        }
+        // The readings, most likely first: a name keeps its number, a unit is dropped.
+        assert_eq!(
+            query_street_hashes("Highway 6 North")[0],
+            street_hash("Highway 6 North").unwrap()
+        );
+        assert_eq!(
+            query_street_hashes("Level 3, 100 King St")[0],
+            street_hash("Level 3 100 King St").unwrap()
+        );
+    }
+
+    /// Keys written into Packs already built must keep matching the router's, so these hashes
+    /// never change without [`KEY_SCHEME`] being bumped (and the Packs rebuilt).
+    #[test]
+    fn key_scheme_is_pinned() {
+        let street = |text: &str| street_hash(text).expect("street");
+        assert_eq!(KEY_SCHEME, 1);
+        assert_eq!(street("King Street"), 8_499_246_586_564_395_725);
+        assert_eq!(street("King St"), street("king street"));
+        assert_eq!(street("St Kilda Rd"), 15_419_769_240_993_744_527);
+        assert_eq!(street("Main St E"), 10_572_333_900_476_732_225);
+        assert_eq!(town_hash("Toronto"), Some(147_203_219_508_908_857));
+        assert_eq!(
+            pair_hash(street("King Street"), town_hash("Toronto").unwrap()),
+            11_569_134_895_287_790_255
+        );
+    }
+
+    /// The layout is xorf's descriptor then its fingerprints; this fails loudly if a xorf upgrade
+    /// changes either, which would make every published filter unreadable or wrong.
+    #[test]
+    fn encoded_bytes_are_pinned() {
+        let keys: Vec<u64> = (1..=100u64)
+            .map(|key| key.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect();
+        let bytes = encode(&keys, 0);
+        assert_eq!(bytes.len(), 252);
+        assert_eq!(xxh3_64_with_seed(&bytes, 0), 11_935_176_968_712_116_154);
     }
 
     #[test]
@@ -663,6 +794,63 @@ mod tests {
         let blob = HEADER_BYTES;
         bad[blob + 16..blob + 20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(RoutingFilter::parse(bad).is_err());
+        // Keys hashed by other rules.
+        let mut bad = good.clone();
+        bad[6] = 9;
+        assert!(format!("{:#}", RoutingFilter::parse(bad).unwrap_err()).contains("key scheme 9"));
+    }
+
+    /// One filter shard blob made by hand: segment length 4, 13 fingerprint bytes.
+    fn hand_built(segment_length: u32, mask: u32, segments: u32, fingerprints: usize) -> Vec<u8> {
+        let mut section = Vec::new();
+        section.extend_from_slice(MAGIC);
+        section.extend_from_slice(&[FORMAT_BINARY_FUSE8, 0]);
+        section.extend_from_slice(&KEY_SCHEME.to_le_bytes());
+        section.extend_from_slice(&ROUTING_SEED.to_le_bytes());
+        section.extend_from_slice(&7u64.to_le_bytes());
+        section.extend_from_slice(&segment_length.to_le_bytes());
+        section.extend_from_slice(&mask.to_le_bytes());
+        section.extend_from_slice(&segments.to_le_bytes());
+        section.extend(std::iter::repeat_n(0xA5, fingerprints));
+        let len = (DESCRIPTOR_BYTES + fingerprints) as u64;
+        section.extend_from_slice(&(HEADER_BYTES as u64).to_le_bytes());
+        section.extend_from_slice(&len.to_le_bytes());
+        section.extend_from_slice(&1u64.to_le_bytes());
+        section
+    }
+
+    #[test]
+    fn parse_rejects_descriptors_whose_lookup_would_leave_the_fingerprints() {
+        // Long enough for `segments + 2 * segment_length`, but not a whole number of segments: a
+        // lookup reaches index 13 of 13 bytes. It used to parse and then panic.
+        let section = hand_built(4, 3, 5, 13);
+        assert!(format!("{:#}", RoutingFilter::parse(section).unwrap_err()).contains("segments"));
+        assert!(RoutingFilter::parse(hand_built(4, 3, 0, 64)).is_err());
+        assert!(RoutingFilter::parse(hand_built(4, 3, u32::MAX - 3, 64)).is_err());
+        // The same shape with whole segments is a filter, and answers without panicking.
+        let filter = RoutingFilter::parse(hand_built(4, 3, 8, 16)).expect("whole segments");
+        for key in pseudo_random(10_000, 3) {
+            filter.maybe_contains(key);
+        }
+    }
+
+    #[test]
+    fn no_corrupted_descriptor_can_make_a_lookup_panic() {
+        let good = encode(&pseudo_random(100, 5), 0);
+        let keys = pseudo_random(2_000, 11);
+        // Every byte of the descriptor, flipped to a few values: parse either refuses it or the
+        // filter answers every key.
+        for at in HEADER_BYTES..HEADER_BYTES + DESCRIPTOR_BYTES {
+            for value in [0u8, 1, 3, 0x7f, 0xff] {
+                let mut bad = good.clone();
+                bad[at] = value;
+                if let Ok(filter) = RoutingFilter::parse(bad) {
+                    for key in &keys {
+                        filter.maybe_contains(*key);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

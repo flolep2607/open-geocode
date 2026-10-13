@@ -874,7 +874,7 @@ fn is_address_number_token(token: &str) -> bool {
 }
 
 /// A house number or unit number, not an ordinal such as "8th".
-fn is_house_number_token(token: &str) -> bool {
+pub(crate) fn is_house_number_token(token: &str) -> bool {
     is_address_number_token(token)
         && !["st", "nd", "rd", "th"]
             .iter()

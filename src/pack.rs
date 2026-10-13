@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_without_streets_has_no_routing_filter_and_still_opens() {
+    fn a_pack_without_streets_gets_an_empty_routing_filter_and_still_opens() {
         let root = temp_root("no-routing");
         let mut writer = PackWriter::create(&root).expect("writer");
         writer
@@ -790,10 +790,13 @@ mod tests {
             )
             .expect("place");
         writer.finish().expect("finish");
-        let reader = PackReader::open(&root).expect("a Pack without the section opens");
+        let reader = PackReader::open(&root).expect("open");
         reader.verify().expect("verify");
-        assert!(!reader.section_sizes().contains_key(ROUTING_FILTER_SECTION));
-        assert!(routing_filter(&reader).is_none());
+        // Absent would read as "built before the section existed, might hold anything"; this Pack
+        // provably holds no street.
+        let filter = routing_filter(&reader).expect("an empty filter");
+        assert_eq!(filter.key_count(), 0);
+        assert!(!filter.maybe_contains(street_hash("King Street").unwrap()));
         assert_eq!(
             first_hit(&root, "rotorua").as_deref(),
             Some("osm:relation:7")
