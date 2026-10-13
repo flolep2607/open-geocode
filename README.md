@@ -176,6 +176,48 @@ The router fetches every filter at startup, then every `--filter-refresh-secs` (
 The first fetch runs in the background, so the router listens at once, and a Runtime that has no filter yet (still starting, or an old Pack) is asked again every 15 seconds.
 An unchanged filter costs a 304.
 
+## Batch geocoding
+
+`POST /geocode/batch` answers many `/geocode` lookups in one request, so a client geocoding millions of addresses pays for one HTTP request per page of addresses instead of one per address.
+The body is JSON, and the `Runtime` and the router both serve it:
+
+```
+POST /geocode/batch
+{"items": [
+  {"address": "15 Eruera Street", "locality": "Rotorua", "postcode": "3010", "street_fallback": true},
+  {"address": "1 King Street", "locality": "Sydney", "country": "AU"}
+]}
+```
+
+An item takes the parameters of `GET /geocode` (`address`, `locality`, `region`, `postcode`, `limit`, `layer`, `street_fallback`), validates the same way and has the same defaults.
+Through the router it also takes `country` and `prefer`, with the meaning they have in the query string.
+The answer is `{"results": [...]}` with one entry per item, **in the order of the items**:
+
+- `{"query": ..., "result": {...} | null}` is what `GET /geocode` would have answered.
+- `{"problem": {...}}` is the Problem Details object (`status`, `error_code`, `detail`, `request_id`, `invalid_params`) `GET /geocode` would have answered, for an item that is not valid (an empty `address`, a `limit` above 50, a text over 256 characters, a field of the wrong type) or that fails.
+  One bad item does not fail the others: the request itself fails only when its body is not a batch (`400 malformed_parameter`) or is too large (`413 batch_too_large`).
+- Through the router an entry also has `route` (what `x-route` says for a GET: `filter-street-town`, `filter-street`, `prefer`, `prefer-fallback`, `fanout` or `country`), and a result has its `country`, also when the item named the country.
+
+Limits: at most 1000 items and 4 MiB per request.
+Both are 413 Problems above the limit; a client with more addresses sends several batches.
+POST only: any other method is a 405 with `Allow: POST`, and `/geocode` stays GET only.
+Every response has the `x-request-id` header, and an item's Problem carries the request id too.
+
+**On the Runtime.**
+The items run in parallel on the blocking pool, in chunks of 16, each chunk holding one of the `--max-concurrency` slots that a `/geocode` request holds.
+A batch is therefore held to the same limit as the single routes, however large it is, and shares the slots with them in arrival order; one slot for the whole batch would let a request use every core and count as one.
+A batch that cannot get its first slot within 2 s is shed whole (503 with `Retry-After: 1`).
+One that got some slots and then none answers an `overloaded` Problem (`status` 503) for the items it did not run, and keeps the answers it has; the client retries those items.
+Each batch is logged at info level as `geocode batch` with its `items`, `found`, `not_found` and `problems`.
+
+**On the router.**
+Each item is decided as `GET /geocode` decides it: its `country`, else the filters and `prefer`, else every Runtime.
+The items for the same Runtime are sent as one sub-batch, all Runtimes at once, and an item that goes to every Runtime is in each one's.
+The answers are put back in the order of the items and picked as for a GET: the one non-null answer, a Problem for an item that is the client's (a bad field, an unknown `country`, an address several countries answer: `country_required`), and a routed Runtime that finds nothing or fails is followed by the others (not asked a second time).
+An item that named its `country` is asked of that Runtime only.
+A Runtime that does not answer its sub-batch fails only its items, with an `upstream_unavailable` Problem (`overloaded` if it shed load); the items for the other Runtimes are answered.
+The router's request id goes to every Runtime as `x-request-id`.
+
 ## Hosted demo
 
 The public live demo and its Cloudflare Worker + Tunnel + VM deployment live in a
