@@ -64,8 +64,8 @@ use crate::{
         problem::Problem,
         request_id::{self, RequestId},
     },
-    routing::{RoutingFilter, pair_hash, query_street_hash, town_hash},
     search::DEFAULT_SEARCH_LIMIT,
+    street_filter::{RoutingFilter, pair_hash, query_street_hash, town_hash},
 };
 
 /// How long the router waits for one Runtime before answering 502 (or leaving it out of a merge).
@@ -765,7 +765,7 @@ mod tests {
     use xxhash_rust::xxh3::xxh3_64;
 
     use super::*;
-    use crate::routing::{FilterEncoder, street_hash};
+    use crate::street_filter::{FilterEncoder, street_hash};
 
     /// A stand-in Runtime. It answers `/search` and `/autocomplete` with fixed results, `/geocode`
     /// with a fixed result, `/readyz` with a status the test can change, and `/routing-filter`

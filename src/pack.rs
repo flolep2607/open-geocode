@@ -33,8 +33,8 @@ use crate::{
     memory::MemoryBudget,
     record::{AddressRecord, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records::{RecordsReader, RecordsWriter},
-    routing::{PlaceTowns, RoutingKeyWriter, record_keys},
     spatial_index::{RecordCells, SpatialIndexWriter},
+    street_filter::{PlaceTowns, RoutingKeyWriter, record_keys},
     text_index::TextIndexWriter,
 };
 
@@ -557,11 +557,11 @@ mod tests {
             AddressComponents, InterpolationAddressComponents, InterpolationRange,
             LocationPrecision, OsmObjectType, PlaceRecord, SourceProvenance, point_geometry,
         },
-        routing::{
+        search::{PackTextSearcher, TextSearchOptions},
+        street_filter::{
             ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION, RoutingFilter, pair_hash, street_hash,
             town_hash,
         },
-        search::{PackTextSearcher, TextSearchOptions},
     };
 
     use super::*;

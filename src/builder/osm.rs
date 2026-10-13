@@ -558,11 +558,11 @@ mod tests {
         pack::PackReader,
         record::{OsmObjectType, SourceProvenance},
         reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseMatchKind},
-        routing::{
+        search::{PackTextSearcher, TextSearchOptions},
+        street_filter::{
             ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION, RoutingFilter, pair_hash,
             query_street_hash, street_hash, town_hash,
         },
-        search::{PackTextSearcher, TextSearchOptions},
     };
 
     use super::{

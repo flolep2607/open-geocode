@@ -32,11 +32,11 @@ use crate::{
     pack::{PackReader, RecordPoint, RecordPointPrecision, RecordSource},
     record::OsmObjectType,
     reverse::{PackReverseGeocoder, ReverseGeocodeOptions, ReverseGeocodeResponse},
-    routing::{ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION},
     search::{
         AddressGeocodeOptions, PackTextSearcher, TextAutocompleteOptions, TextSearchHit,
         TextSearchOptions,
     },
+    street_filter::{ROUTING_FILTER_SECTION, ROUTING_FILTER_VERSION},
 };
 
 #[derive(Debug, Clone)]
@@ -915,7 +915,7 @@ mod router_tests {
 
     #[tokio::test]
     async fn routing_filter_is_served_with_an_etag_and_only_by_get() {
-        use crate::routing::{RoutingFilter, pair_hash, street_hash, town_hash};
+        use crate::street_filter::{RoutingFilter, pair_hash, street_hash, town_hash};
 
         let pack = temp_path("routing-filter");
         write_pack(&pack);

@@ -71,7 +71,7 @@ pub(super) fn publish(
         bail!("text index document count does not match Pack records");
     }
     crate::spatial_index::SpatialIndexReader::open(reader.container(), reader.records().clone())?;
-    crate::routing::validate(reader.container())?;
+    crate::street_filter::validate(reader.container())?;
     drop((reader, text));
 
     sync_tree(generation)?;
