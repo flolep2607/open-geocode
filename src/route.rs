@@ -872,6 +872,12 @@ fn pick_geocode(state: &RouteState, answers: Vec<(String, Value)>, streets: &[u6
             first_body = Some(body);
         }
     }
+    // A house beats a street, and a street beats an `area_fallback` postcode or town centre: only
+    // answers at the best level compete. Postcodes like 2163 exist in several countries, so an
+    // area answer from one country must not make a street found in another ambiguous.
+    if let Some(best) = found.iter().map(|(_, body)| match_rank(body)).min() {
+        found.retain(|(_, body)| match_rank(body) == best);
+    }
     if found.len() > 1 {
         let holders = found.iter().filter(|(country, _)| holds(country)).count();
         if holders == 1 {
@@ -886,6 +892,16 @@ fn pick_geocode(state: &RouteState, answers: Vec<(String, Value)>, streets: &[u6
             Picked::One(body, country)
         }
         _ => Picked::Ambiguous(found.into_iter().map(|(country, _)| country).collect()),
+    }
+}
+
+/// How close a `/geocode` answer is to the address asked: 0 the house, 1 its street, 2 only
+/// its postcode or town (`area_fallback`).
+fn match_rank(body: &Value) -> u8 {
+    match body["result"]["layer"].as_str() {
+        Some("address" | "interpolation") => 0,
+        Some("street") => 1,
+        _ => 2,
     }
 }
 
@@ -1985,6 +2001,36 @@ mod tests {
         }
         let response = call("/readyz").await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_street_beats_an_area_answer_from_another_country() {
+        let state = RouteState::new(vec![
+            ("AU".to_string(), "http://au".to_string()),
+            ("NZ".to_string(), "http://nz".to_string()),
+        ])
+        .expect("state");
+        let answer =
+            |layer: &str| json!({ "query": "q", "result": { "layer": layer, "label": layer } });
+        let picked = pick_geocode(
+            &state,
+            vec![
+                ("AU".to_string(), answer("postcode")),
+                ("NZ".to_string(), answer("street")),
+            ],
+            &[],
+        );
+        assert!(matches!(picked, Picked::One(_, ref country) if country == "NZ"));
+        // Two postcode centres, as for 2163 in both countries: nothing tells them apart.
+        let picked = pick_geocode(
+            &state,
+            vec![
+                ("AU".to_string(), answer("postcode")),
+                ("NZ".to_string(), answer("postcode")),
+            ],
+            &[],
+        );
+        assert!(matches!(picked, Picked::Ambiguous(_)));
     }
 
     #[test]
