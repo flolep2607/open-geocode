@@ -323,6 +323,7 @@ fn geocode_row(
             limit: options.limit,
             layer: options.layer.clone(),
             street_fallback: options.street_fallback,
+            area_fallback: false,
         })?;
         tried_queries.push(address);
         if let Some(response) = response {

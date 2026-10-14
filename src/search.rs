@@ -20,7 +20,7 @@ use tantivy::{
 use crate::{
     pack::{PackReader, RecordId, RecordPointPrecision, RecordSummary},
     record::{Layer, OsmObjectType},
-    spatial_index::SpatialIndexReader,
+    spatial_index::{SpatialIndexReader, haversine_m},
     text_index::{TextIndexFields, normalize_index_text, open_text_index, unit_token},
 };
 
@@ -88,6 +88,10 @@ pub struct AddressGeocodeOptions {
     /// requested locality or postcode. Off by default: the result is a point
     /// on the street, not the house.
     pub street_fallback: bool,
+    /// When neither the house nor its street matches, answer with the
+    /// postcode's centroid, else the named town's. Off by default: the result
+    /// only places the address in its town.
+    pub area_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -154,6 +158,17 @@ const MAX_RANK_WINDOW: usize = 256;
 /// street records carry no locality text, so the area can only be checked after
 /// the search. A name with more namesakes than this is not resolved.
 const STREET_FALLBACK_LIMIT: usize = 1_000;
+/// Records of one name within this distance of each other are one town (a
+/// suburb has a boundary and a place node); farther apart, the name alone
+/// cannot say which town is meant, and the area fallback answers nothing.
+const AREA_SPREAD_M: f64 = 25_000.0;
+const AREA_FALLBACK_LIMIT: usize = 50;
+const TOWN_LAYERS: [Layer; 4] = [
+    Layer::Locality,
+    Layer::Neighbourhood,
+    Layer::Place,
+    Layer::District,
+];
 
 impl PackTextSearcher {
     pub fn open(pack_path: impl AsRef<Path>) -> Result<Self> {
@@ -265,7 +280,116 @@ impl PackTextSearcher {
             }
         }
 
-        self.geocode_street(address, &options, &desired, &mut context_labels)
+        if let Some(hit) = self.geocode_street(address, &options, &desired, &mut context_labels)? {
+            return Ok(Some(hit));
+        }
+        if !options.area_fallback || options.layer.is_some() {
+            return Ok(None);
+        }
+        self.geocode_area(options.postcode.as_deref(), &desired, &mut context_labels)
+    }
+
+    /// The address is not in the data, but its area is: the postcode's
+    /// centroid, else the town's, still places it in the right town. A name
+    /// held by towns far apart answers nothing rather than guess one.
+    fn geocode_area(
+        &self,
+        postcode_text: Option<&str>,
+        desired: &DesiredContext,
+        context_labels: &mut ContextLabels,
+    ) -> Result<Option<AddressGeocodeHit>> {
+        if let (Some(text), Some(postcode)) = (postcode_text, desired.postcode.as_deref())
+            && let Some(hit) = self.unique_area(
+                text,
+                &[Layer::Postcode],
+                None,
+                context_labels,
+                |label, fuzzy| !fuzzy && label.split_whitespace().collect::<String>() == postcode,
+            )?
+        {
+            return Ok(Some(hit));
+        }
+        let Some(locality) = desired.locality.as_deref() else {
+            return Ok(None);
+        };
+        let tokens = locality.split_whitespace().count();
+        let region = desired.region.as_ref().map(|region| DesiredContext {
+            region: Some(region.clone()),
+            ..DesiredContext::default()
+        });
+        self.unique_area(
+            locality,
+            &TOWN_LAYERS,
+            region.as_ref(),
+            context_labels,
+            |label, fuzzy| {
+                label == locality || (fuzzy && label.split_whitespace().count() == tokens)
+            },
+        )
+    }
+
+    /// The best-ranked record named `name` in `layers`, when every such record
+    /// lies within [`AREA_SPREAD_M`] of it. Exact names first, then typo-tolerant
+    /// ones: `same_name(label, fuzzy)` judges the normalized label before its
+    /// first comma, `fuzzy` on the typo-tolerant pass. A
+    /// `region` narrows the records when any is in it.
+    fn unique_area(
+        &self,
+        name: &str,
+        layers: &[Layer],
+        region: Option<&DesiredContext>,
+        context_labels: &mut ContextLabels,
+        same_name: impl Fn(&str, bool) -> bool,
+    ) -> Result<Option<AddressGeocodeHit>> {
+        for mode in [MatchMode::Strict, MatchMode::Fuzzy] {
+            let mut found: Vec<(String, TextSearchHit)> = Vec::new();
+            for layer in layers {
+                // Per layer: the set skips a variant already tried, and each layer is its own query.
+                let mut tried_fuzzy_variants = HashSet::new();
+                let (query, hits) = self.search_variants(
+                    name,
+                    Some(layer.as_str()),
+                    AREA_FALLBACK_LIMIT,
+                    mode,
+                    &mut tried_fuzzy_variants,
+                    |hit| {
+                        let label = hit.record.label.split(',').next().unwrap_or_default();
+                        Ok(hit.record.point.is_some()
+                            && normalized_context_for_match(Some(label))
+                                .is_some_and(|label| same_name(&label, mode == MatchMode::Fuzzy)))
+                    },
+                )?;
+                found.extend(hits.into_iter().map(|hit| (query.clone(), hit)));
+            }
+            if let Some(region) = region {
+                let mut in_region = Vec::new();
+                for entry in &found {
+                    if self.hit_matches_address_context(&entry.1, region, false, context_labels)? {
+                        in_region.push(entry.clone());
+                    }
+                }
+                if !in_region.is_empty() {
+                    found = in_region;
+                }
+            }
+            // Best score first across the layers; ties keep layer order.
+            found.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
+            let Some((query, best)) = found.first() else {
+                continue;
+            };
+            let point = best.record.point.expect("accepted hits have a point");
+            let one_town = found.iter().all(|(_, hit)| {
+                hit.record.point.is_some_and(|other| {
+                    haversine_m(point.lon, point.lat, other.lon, other.lat) <= AREA_SPREAD_M
+                })
+            });
+            return if one_town {
+                AddressGeocodeHit::new(query.clone(), best.clone()).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        Ok(None)
     }
 
     /// The house is not in the data, but its street may be: a point on the
@@ -1705,6 +1829,7 @@ mod tests {
                     limit: 10,
                     layer: None,
                     street_fallback: true,
+                    area_fallback: false,
                 })
                 .expect("geocode")
                 .is_none()
@@ -1858,6 +1983,7 @@ mod tests {
                     limit: 10,
                     layer: None,
                     street_fallback: false,
+                    area_fallback: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id)
@@ -1990,6 +2116,7 @@ mod tests {
                 limit: 10,
                 layer: None,
                 street_fallback: false,
+                area_fallback: false,
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
@@ -2012,6 +2139,7 @@ mod tests {
                 limit: 10,
                 layer: None,
                 street_fallback: true,
+                area_fallback: false,
             })
             .expect("geocode")
             .map(|hit| (hit.hit.record.id, hit.match_level))
@@ -2075,6 +2203,83 @@ mod tests {
     }
 
     #[test]
+    fn area_fallback_answers_the_postcode_then_a_unique_town() {
+        use crate::record::{
+            DerivedSourceProvenance, PlaceLayer, PlaceRecord, PostcodeRecord, Record,
+        };
+
+        let temp_dir = temp_pack_path("geocode-area-fallback");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = PackWriter::create(&temp_dir).expect("writer");
+        let places = [
+            (PlaceLayer::Neighbourhood, "Capalaba", 153.19, -27.52, 1),
+            (PlaceLayer::Neighbourhood, "Capalaba", 153.20, -27.54, 2),
+            // Namesakes 600 km apart: the name alone cannot pick one.
+            (PlaceLayer::Locality, "Richmond", 145.00, -37.82, 3),
+            (PlaceLayer::Locality, "Richmond", 150.75, -33.60, 4),
+        ];
+        for (layer, name, lon, lat, object_id) in places {
+            writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            name: name.to_string(),
+                            place_type: "suburb".to_string(),
+                            geometry: point_geometry(lon, lat),
+                            source: SourceProvenance::osm(OsmObjectType::Node, object_id),
+                        },
+                    ),
+                    None,
+                )
+                .expect("place");
+        }
+        writer
+            .write(
+                &Record::Postcode(PostcodeRecord {
+                    postcode: "M5V 1A1".to_string(),
+                    geometry: point_geometry(-79.40, 43.64),
+                    source: DerivedSourceProvenance::osm_address_records(3),
+                }),
+                None,
+            )
+            .expect("postcode");
+        writer.finish().expect("finish");
+        let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
+        let area = |locality: Option<&str>, postcode: Option<&str>, area_fallback: bool| {
+            searcher
+                .geocode_address(AddressGeocodeOptions {
+                    address: "12 Nowhere Street".to_string(),
+                    locality: locality.map(str::to_string),
+                    region: None,
+                    postcode: postcode.map(str::to_string),
+                    limit: 10,
+                    layer: None,
+                    street_fallback: true,
+                    area_fallback,
+                })
+                .expect("geocode")
+                .map(|hit| (hit.hit.record.layer, hit.hit.record.label))
+        };
+
+        let town = Some(("neighbourhood".to_string(), "Capalaba".to_string()));
+        assert_eq!(area(Some("CAPALABA"), None, true), town);
+        assert_eq!(
+            area(Some("Copalaba"), None, true),
+            town,
+            "a typo still finds the town"
+        );
+        assert_eq!(area(Some("CAPALABA"), None, false), None, "off by default");
+        assert_eq!(area(Some("Richmond"), None, true), None);
+        assert_eq!(
+            area(Some("Richmond"), Some("m5v 1a1"), true),
+            Some(("postcode".to_string(), "M5V 1A1".to_string())),
+            "the postcode comes before the town"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn geocode_rejects_a_different_region() {
         use crate::{
             context::AdminContextTuple,
@@ -2123,6 +2328,7 @@ mod tests {
                     limit: 10,
                     layer: None,
                     street_fallback: false,
+                    area_fallback: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id)
@@ -2239,6 +2445,7 @@ mod tests {
                     limit,
                     layer: None,
                     street_fallback: false,
+                    area_fallback: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id);
@@ -2257,6 +2464,7 @@ mod tests {
             limit: 1,
             layer: None,
             street_fallback: false,
+            area_fallback: false,
         };
         assert_eq!(desired_address_context(&options(" ")), (None, None, None));
         assert_eq!(

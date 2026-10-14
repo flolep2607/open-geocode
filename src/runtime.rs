@@ -165,6 +165,8 @@ struct GeocodeParams {
     layer: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     street_fallback: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    area_fallback: bool,
 }
 
 /// A field that is its default when absent or `null`, as the `Option` fields are. A batch item
@@ -202,6 +204,7 @@ impl GeocodeParams {
             limit: self.limit,
             layer: self.layer,
             street_fallback: self.street_fallback,
+            area_fallback: self.area_fallback,
         })
     }
 }
@@ -1229,6 +1232,7 @@ mod router_tests {
                 limit: 0,
                 layer: None,
                 street_fallback: false,
+                area_fallback: false,
             })
         };
         let id = Some("ray-panic".to_string());

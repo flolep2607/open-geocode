@@ -74,7 +74,7 @@ pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
 /// Runtime and the router, which answers such an item itself instead of asking every Runtime.
 pub(crate) fn malformed_batch_item() -> Problem {
     Problem::malformed_parameter(
-        "an item must be an object of address, locality, region, postcode, layer, limit and street_fallback",
+        "an item must be an object of address, locality, region, postcode, layer, limit, street_fallback and area_fallback",
     )
 }
 
