@@ -189,9 +189,9 @@ POST /geocode/batch
 ]}
 ```
 
-An item takes the parameters of `GET /geocode` (`address`, `locality`, `region`, `postcode`, `limit`, `layer`, `street_fallback`, `area_fallback`, `area_exact`), validates the same way and has the same defaults.
+An item takes the parameters of `GET /geocode` (`address`, `locality`, `region`, `postcode`, `limit`, `layer`, `street_fallback`, `area_fallback`), validates the same way and has the same defaults.
 
-`area_fallback=true` answers an address whose house and street are both missing with its postcode's centroid (layer `postcode`), else the named town's (layer `locality`, `neighbourhood`, `place` or `district`). A town name held by records more than 25 km apart answers nothing. `area_exact=true` skips the typo-tolerant town pass; the router sets it when it asks a Runtime other than the item's own.
+`area_fallback=true` answers an address whose house and street are both missing with its postcode's centroid (layer `postcode`), else the named town's (layer `locality`, `neighbourhood`, `place` or `district`). A town name held by records more than 25 km apart answers nothing.
 Through the router it also takes `country` and `prefer`, with the meaning they have in the query string.
 The answer is `{"results": [...]}` with one entry per item, **in the order of the items**:
 

@@ -92,9 +92,6 @@ pub struct AddressGeocodeOptions {
     /// postcode's centroid, else the named town's. Off by default: the result
     /// only places the address in its town.
     pub area_fallback: bool,
-    /// Only an exact town name, no typo-tolerant pass: a fuzzy namesake is
-    /// no evidence when the address may be in another country.
-    pub area_exact: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -289,12 +286,7 @@ impl PackTextSearcher {
         if !options.area_fallback || options.layer.is_some() {
             return Ok(None);
         }
-        self.geocode_area(
-            options.postcode.as_deref(),
-            &desired,
-            options.area_exact,
-            &mut context_labels,
-        )
+        self.geocode_area(options.postcode.as_deref(), &desired, &mut context_labels)
     }
 
     /// The address is not in the data, but its area is: the postcode's
@@ -304,7 +296,6 @@ impl PackTextSearcher {
         &self,
         postcode_text: Option<&str>,
         desired: &DesiredContext,
-        exact: bool,
         context_labels: &mut ContextLabels,
     ) -> Result<Option<AddressGeocodeHit>> {
         if let (Some(text), Some(postcode)) = (postcode_text, desired.postcode.as_deref())
@@ -332,7 +323,7 @@ impl PackTextSearcher {
             region.as_ref(),
             context_labels,
             |label, fuzzy| {
-                label == locality || (fuzzy && !exact && label.split_whitespace().count() == tokens)
+                label == locality || (fuzzy && label.split_whitespace().count() == tokens)
             },
         )
     }
@@ -1839,7 +1830,6 @@ mod tests {
                     layer: None,
                     street_fallback: true,
                     area_fallback: false,
-                    area_exact: false,
                 })
                 .expect("geocode")
                 .is_none()
@@ -1994,7 +1984,6 @@ mod tests {
                     layer: None,
                     street_fallback: false,
                     area_fallback: false,
-                    area_exact: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id)
@@ -2128,7 +2117,6 @@ mod tests {
                 layer: None,
                 street_fallback: false,
                 area_fallback: false,
-                area_exact: false,
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
@@ -2152,7 +2140,6 @@ mod tests {
                 layer: None,
                 street_fallback: true,
                 area_fallback: false,
-                area_exact: false,
             })
             .expect("geocode")
             .map(|hit| (hit.hit.record.id, hit.match_level))
@@ -2259,10 +2246,7 @@ mod tests {
             .expect("postcode");
         writer.finish().expect("finish");
         let searcher = PackTextSearcher::open(&temp_dir).expect("searcher");
-        let area_with = |locality: Option<&str>,
-                         postcode: Option<&str>,
-                         area_fallback: bool,
-                         area_exact: bool| {
+        let area = |locality: Option<&str>, postcode: Option<&str>, area_fallback: bool| {
             searcher
                 .geocode_address(AddressGeocodeOptions {
                     address: "12 Nowhere Street".to_string(),
@@ -2273,13 +2257,9 @@ mod tests {
                     layer: None,
                     street_fallback: true,
                     area_fallback,
-                    area_exact,
                 })
                 .expect("geocode")
                 .map(|hit| (hit.hit.record.layer, hit.hit.record.label))
-        };
-        let area = |locality: Option<&str>, postcode: Option<&str>, area_fallback: bool| {
-            area_with(locality, postcode, area_fallback, false)
         };
 
         let town = Some(("neighbourhood".to_string(), "Capalaba".to_string()));
@@ -2290,12 +2270,6 @@ mod tests {
             "a typo still finds the town"
         );
         assert_eq!(area(Some("CAPALABA"), None, false), None, "off by default");
-        assert_eq!(area_with(Some("CAPALABA"), None, true, true), town);
-        assert_eq!(
-            area_with(Some("Copalaba"), None, true, true),
-            None,
-            "exact: no typo pass"
-        );
         assert_eq!(area(Some("Richmond"), None, true), None);
         assert_eq!(
             area(Some("Richmond"), Some("m5v 1a1"), true),
@@ -2355,7 +2329,6 @@ mod tests {
                     layer: None,
                     street_fallback: false,
                     area_fallback: false,
-                    area_exact: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id)
@@ -2473,7 +2446,6 @@ mod tests {
                     layer: None,
                     street_fallback: false,
                     area_fallback: false,
-                    area_exact: false,
                 })
                 .expect("geocode")
                 .map(|hit| hit.hit.record.id);
@@ -2493,7 +2465,6 @@ mod tests {
             layer: None,
             street_fallback: false,
             area_fallback: false,
-            area_exact: false,
         };
         assert_eq!(desired_address_context(&options(" ")), (None, None, None));
         assert_eq!(

@@ -1286,17 +1286,15 @@ async fn geocode_batch(
             }
         }
     }
-    // Asked of every Runtime, or of the others after its own found nothing, a town must match
-    // exactly: a typo-tolerant namesake abroad is not the address (Rangiora, two in NZ so none
-    // there, fuzzily became Kangiara, NSW). An exact town held by one country still answers.
+    // A postcode or town centre is an answer only in the address's own country. Asked of every
+    // Runtime, or of the others after its own found nothing, an `area_fallback` answer is a
+    // namesake abroad: Rangiora (two in NZ, so none) fuzzily became Kangiara, NSW.
     let abroad: Vec<Value> = items
         .iter()
         .map(|item| {
             let mut item = item.clone();
-            if let Some(fields) = item.as_object_mut()
-                && fields.contains_key("area_fallback")
-            {
-                fields.insert("area_exact".to_string(), Value::Bool(true));
+            if let Some(fields) = item.as_object_mut() {
+                fields.remove("area_fallback");
             }
             item
         })
@@ -1716,15 +1714,9 @@ mod tests {
                         .expect("items")
                         .iter()
                         .zip(&addresses)
-                        .map(|(item, address)| {
-                            match (
-                                item["area_fallback"].as_bool(),
-                                item["area_exact"].as_bool(),
-                            ) {
-                                (Some(true), Some(true)) => format!("{address} +exact"),
-                                (Some(true), _) => format!("{address} +area"),
-                                _ => address.clone(),
-                            }
+                        .map(|(item, address)| match item["area_fallback"].as_bool() {
+                            Some(true) => format!("{address} +area"),
+                            _ => address.clone(),
                         })
                         .collect();
                     fake.batches.lock().unwrap().push((id, seen));
@@ -2888,9 +2880,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn area_fallback_is_exact_outside_the_items_own_runtime() {
-        // Routed to NZ, which finds nothing: the others are asked for an exact town only, and an
-        // item with no country evidence goes to every Runtime that way.
+    async fn area_fallback_is_asked_only_of_the_items_own_runtime() {
+        // Routed to NZ, which finds nothing: the others are asked without area_fallback, and an
+        // item with no country evidence goes to every Runtime without it.
         let c = countries([Value::Null, Value::Null, Value::Null]).await;
         batch(
             &c.base,
@@ -2902,11 +2894,11 @@ mod tests {
         .await;
         assert_eq!(
             c.nz.batches().concat(),
-            vec!["15 Eruera Street +area", "1 Nowhere Road +exact"]
+            vec!["15 Eruera Street +area", "1 Nowhere Road"]
         );
         assert_eq!(
             c.au.batches().concat(),
-            vec!["1 Nowhere Road +exact", "15 Eruera Street +exact"]
+            vec!["1 Nowhere Road", "15 Eruera Street"]
         );
     }
 
