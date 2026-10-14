@@ -1286,8 +1286,30 @@ async fn geocode_batch(
             }
         }
     }
+    // A postcode or town centre is an answer only in the address's own country. Asked of every
+    // Runtime, or of the others after its own found nothing, an `area_fallback` answer is a
+    // namesake abroad: Rangiora (two in NZ, so none) fuzzily became Kangiara, NSW.
+    let abroad: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(fields) = item.as_object_mut() {
+                fields.remove("area_fallback");
+            }
+            item
+        })
+        .collect();
+    let first_items: Vec<Value> = plans
+        .iter()
+        .zip(&items)
+        .zip(&abroad)
+        .map(|((plan, item), abroad)| match plan {
+            Plan::Fanout => abroad.clone(),
+            _ => item.clone(),
+        })
+        .collect();
     let mut first = none();
-    state.ask_batch(&asks, &items, &mut first, id).await;
+    state.ask_batch(&asks, &first_items, &mut first, id).await;
 
     // What each item still needs the others for, with what they have said so far.
     let mut others = none();
@@ -1325,7 +1347,7 @@ async fn geocode_batch(
             }
         }
     }
-    state.ask_batch(&again, &items, &mut others, id).await;
+    state.ask_batch(&again, &abroad, &mut others, id).await;
     for index in fanned {
         let replies = std::mem::take(&mut others[index]);
         let item = pick_item(&state, replies, &keys[index].streets, id);
@@ -1686,7 +1708,18 @@ mod tests {
                         .get("x-request-id")
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_string);
-                    fake.batches.lock().unwrap().push((id, addresses.clone()));
+                    // Recorded with " +area" when the item asked for area_fallback.
+                    let seen = body["items"]
+                        .as_array()
+                        .expect("items")
+                        .iter()
+                        .zip(&addresses)
+                        .map(|(item, address)| match item["area_fallback"].as_bool() {
+                            Some(true) => format!("{address} +area"),
+                            _ => address.clone(),
+                        })
+                        .collect();
+                    fake.batches.lock().unwrap().push((id, seen));
                     let status = fake.fail_with.load(Ordering::SeqCst);
                     if status != 0 {
                         let mut response = StatusCode::from_u16(status)
@@ -2844,6 +2877,29 @@ mod tests {
         assert!(results[0]["result"].is_null());
         assert_eq!(results[0]["query"], "15 Eruera Street");
         assert_eq!(nz.batches().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn area_fallback_is_asked_only_of_the_items_own_runtime() {
+        // Routed to NZ, which finds nothing: the others are asked without area_fallback, and an
+        // item with no country evidence goes to every Runtime without it.
+        let c = countries([Value::Null, Value::Null, Value::Null]).await;
+        batch(
+            &c.base,
+            json!([
+                { "address": "15 Eruera Street", "locality": "Rotorua", "area_fallback": true },
+                { "address": "1 Nowhere Road", "area_fallback": true },
+            ]),
+        )
+        .await;
+        assert_eq!(
+            c.nz.batches().concat(),
+            vec!["15 Eruera Street +area", "1 Nowhere Road"]
+        );
+        assert_eq!(
+            c.au.batches().concat(),
+            vec!["1 Nowhere Road", "15 Eruera Street"]
+        );
     }
 
     #[tokio::test]
