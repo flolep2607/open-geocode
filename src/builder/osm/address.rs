@@ -60,6 +60,15 @@ const AREA_KEYS: [&str; 3] = ["addr:suburb", "addr:quarter", "addr:neighbourhood
 /// `addr:block_number=10`, `addr:housenumber=8`).
 const BLOCK_AREA_KEYS: [&str; 2] = ["addr:quarter", "addr:neighbourhood"];
 
+/// The keys that state an address's town, in order of preference.
+const LOCALITY_KEYS: [&str; 5] = [
+    "addr:city",
+    "addr:suburb",
+    "addr:town",
+    "addr:village",
+    "addr:hamlet",
+];
+
 /// The address `addr:*` tags state, if they name a house number and a street
 /// or place, or a number of the block scheme.
 ///
@@ -97,7 +106,7 @@ pub(crate) fn address_components(
         street,
         place,
         unit: tags.cleaned("addr:unit"),
-        locality: tags.cleaned("addr:city"),
+        locality: address_locality(tags),
         areas,
         region: tags
             .cleaned("addr:state")
@@ -105,6 +114,12 @@ pub(crate) fn address_components(
         postcode: tags.cleaned("addr:postcode"),
         country: tags.cleaned("addr:country"),
     })
+}
+
+/// The town an address names: `addr:city`, or where the mapper left it empty
+/// (common in Australia and New Zealand) the finest of the other place keys.
+fn address_locality(tags: &BTreeMap<String, String>) -> Option<String> {
+    LOCALITY_KEYS.into_iter().find_map(|key| tags.cleaned(key))
 }
 
 pub(crate) fn collect_clean_tags<'a>(
@@ -177,6 +192,31 @@ mod tests {
         }
         assert_eq!(record.source.object_type, OsmObjectType::Node);
         assert_eq!(record.source.tags, None);
+    }
+
+    #[test]
+    fn reads_the_locality_from_the_other_place_keys_when_addr_city_is_empty() {
+        let locality = |tags: &[(&str, &str)]| {
+            let mut all = vec![
+                ("addr:housenumber", "13"),
+                ("addr:street", "Peacock Street"),
+            ];
+            all.extend_from_slice(tags);
+            address_record_from_candidate(&candidate(&all))
+                .expect("address")
+                .address
+                .locality
+        };
+        assert_eq!(locality(&[("addr:suburb", "Kew")]).as_deref(), Some("Kew"));
+        assert_eq!(
+            locality(&[("addr:city", "Melbourne"), ("addr:suburb", "Kew")]).as_deref(),
+            Some("Melbourne")
+        );
+        assert_eq!(
+            locality(&[("addr:village", "Mirboo")]).as_deref(),
+            Some("Mirboo")
+        );
+        assert_eq!(locality(&[]), None);
     }
 
     #[test]
