@@ -273,7 +273,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             ..BuilderReport::default()
         },
         audit: Audit::create(writer.generation())?,
-        postcodes: PostcodeAccumulator::default(),
+        postcodes: Vec::new(),
         records: ExternalSorter::new(&scratch, "records", &memory, budget),
         addresses: ExternalSorter::new(&scratch, "addresses", &memory, budget),
         context_records: ExternalSorter::new(
@@ -304,6 +304,7 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
     // and the node join merges a request stream sorted by node id against
     // nodes that ascend only within one sorted PBF.
     for input in &options.inputs {
+        build.postcodes.push(PostcodeAccumulator::default());
         // Pass 1: classify everything.
         let phase = Instant::now();
         let mut requests = ExternalSorter::new(&scratch, "node-requests", &memory, budget);
@@ -464,7 +465,10 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
         build.push(record, Some(origin))?;
     }
     let mut postcode_centroids = Vec::new();
-    for record in std::mem::take(&mut build.postcodes).into_records() {
+    for record in std::mem::take(&mut build.postcodes)
+        .into_iter()
+        .flat_map(PostcodeAccumulator::into_records)
+    {
         build.report.accept_postcode();
         if let Some(point) = point_lon_lat(&record.geometry) {
             postcode_centroids.push((record.postcode.clone(), point));
@@ -701,7 +705,10 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
 struct Build {
     report: BuilderReport,
     audit: Audit,
-    postcodes: PostcodeAccumulator,
+    /// Postcode centroids, one accumulator per input: a code means a different
+    /// area in each country ("2110" is in Sydney and in Papakura), so the
+    /// extracts of one Pack do not share one.
+    postcodes: Vec<PostcodeAccumulator>,
     /// POIs, interpolations and streets, then the addresses.
     records: ExternalSorter<PendingRecord>,
     /// Addresses, until every one is known and they can join `records` a
@@ -722,7 +729,10 @@ impl Build {
             postcodes,
         } = emitted;
         self.report.merge(report);
-        self.postcodes.merge(postcodes);
+        self.postcodes
+            .last_mut()
+            .expect("an input is being read")
+            .merge(postcodes);
         for rejection in &rejections {
             self.audit.write(rejection)?;
         }
@@ -1249,6 +1259,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A postcode names a different area in each country, so two extracts that
+    /// both state "2110" get a centroid each, not one between them.
+    #[test]
+    fn keeps_a_postcode_of_each_extract_apart() {
+        let dir = temp_dir("postcode-per-extract");
+        let extract = |name: &str, lat: f64, lon: f64| {
+            let path = dir.join(name);
+            write_pbf(
+                &path,
+                &[vec![node(
+                    1,
+                    lat,
+                    lon,
+                    &[
+                        ("addr:housenumber", "10"),
+                        ("addr:street", "King Street"),
+                        ("addr:postcode", "2110"),
+                    ],
+                )]],
+            );
+            path
+        };
+        let (sydney, papakura) = (
+            extract("sydney.osm.pbf", -33.83, 151.14),
+            extract("papakura.osm.pbf", -37.06, 174.94),
+        );
+
+        let one = build_all(&dir.join("one"), &[&sydney], None);
+        let both = build_all(&dir.join("both"), &[&sydney, &papakura], None);
+
+        assert_eq!(one.accepted.postcode_records, 1);
+        assert_eq!(both.accepted.postcode_records, 2);
     }
 
     fn build(root: &Path, input: &Path, memory_budget_bytes: Option<usize>) -> BuilderReport {
