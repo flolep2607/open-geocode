@@ -1834,6 +1834,78 @@ mod tests {
     }
 
     #[test]
+    fn geocode_does_not_read_a_unit_as_the_house_number() {
+        let temp_dir = temp_pack_path("geocode-unit");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let flat = address_record("osm:node:1", "", "10/1367", "Eruera Street", None, None);
+        let mut tagged = address_record("osm:node:2", "", "88", "Eruera Street", None, None);
+        tagged.address.unit = Some("7".to_string());
+        writer.write(&flat.into(), None).expect("flat");
+        writer.write(&tagged.into(), None).expect("tagged");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for address in [
+            "1367 Eruera Street",
+            "10/1367 Eruera Street",
+            "unit 10 1367 Eruera Street",
+        ] {
+            assert_eq!(
+                geocode(&searcher, address, None, None).as_deref(),
+                Some("osm:node:1"),
+                "{address}"
+            );
+        }
+        assert_eq!(
+            geocode(&searcher, "7/88 Eruera Street", None, None).as_deref(),
+            Some("osm:node:2")
+        );
+        // Neither 10 nor 7 is a house on this street.
+        assert_eq!(geocode(&searcher, "10 Eruera Street", None, None), None);
+        assert_eq!(geocode(&searcher, "7 Eruera Street", None, None), None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn geocode_finds_the_flat_that_a_query_names() {
+        let temp_dir = temp_pack_path("geocode-flats");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, number) in [(1, "1/12"), (2, "2/12"), (3, "3/12")] {
+            let flat = address_record(
+                &format!("osm:node:{id}"),
+                "",
+                number,
+                "Smith Street",
+                None,
+                Some("3000"),
+            );
+            writer.write(&flat.into(), None).expect("flat");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        for postcode in [None, Some("3000")] {
+            for address in ["3/12 Smith Street", "unit 3 12 Smith Street"] {
+                assert_eq!(
+                    geocode(&searcher, address, None, postcode).as_deref(),
+                    Some("osm:node:3"),
+                    "{address} {postcode:?}"
+                );
+            }
+        }
+        // The building is found by its number, and a flat that does not exist
+        // falls back to it; a unit alone is not a house.
+        assert!(geocode(&searcher, "12 Smith Street", None, None).is_some());
+        assert!(geocode(&searcher, "9/12 Smith Street", None, None).is_some());
+        assert_eq!(geocode(&searcher, "3 Smith Street", None, None), None);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn geocode_infers_the_postcode_area_of_hits_without_one() {
         let temp_dir = temp_pack_path("geocode-inferred-postcode");
         let _ = std::fs::remove_dir_all(&temp_dir);

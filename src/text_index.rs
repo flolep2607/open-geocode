@@ -326,19 +326,21 @@ impl Fields {
         for street in &projected.streets {
             add_text_if_present(&mut document, self.street_text, Some(street));
         }
-        // Each value of a list ("12;14") is a house number of its own.
+        // Each value of a list ("12;14") is a house number of its own, and a
+        // flat ("3/12") is also found by the building's number.
         for number in projected
             .address_number
             .iter()
             .flat_map(|number| number.split(';'))
         {
             add_normalized_text_if_present(&mut document, self.address_number, Some(number));
+            if let Some((_, building)) = split_flat_number(number) {
+                add_normalized_text_if_present(&mut document, self.address_number, Some(building));
+            }
         }
-        if let Some(number) = projected
-            .address_number
-            .as_deref()
-            .and_then(base_house_number)
-        {
+        if let Some(number) = projected.address_number.as_deref().and_then(|number| {
+            base_house_number(split_flat_number(number).map_or(number, |(_, building)| building))
+        }) {
             document.add_u64(self.house_number, number.into());
         }
         add_normalized_text_if_present(
@@ -988,6 +990,19 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
     token.chars().all(|character| character.is_ascii_digit())
 }
 
+/// The unit and the building number of a flat written "UNIT/NUMBER", as
+/// Australia and New Zealand do ("10/1367"). Only an all-digit unit before a
+/// number that starts with a digit is one, so "10/A", "12-14/3" and "1/2/34"
+/// are not split. This reads unit first: where "10/12" is BUILDING/FLAT it
+/// reads the wrong way round, and the country is too rarely tagged to tell.
+fn split_flat_number(number: &str) -> Option<(&str, &str)> {
+    let (unit, building) = number.rsplit_once('/')?;
+    (!unit.is_empty()
+        && unit.bytes().all(|byte| byte.is_ascii_digit())
+        && building.starts_with(|character: char| character.is_ascii_digit()))
+    .then_some((unit, building))
+}
+
 /// The digits a house number starts with: 407 of "407A", "407 1/2" and
 /// "407;409". `None` when it does not start with one.
 pub(crate) fn base_house_number(number: &str) -> Option<u32> {
@@ -1332,6 +1347,15 @@ mod tests {
         );
         // Only the street field: a name keeps its letters.
         assert_eq!(search_text("Plan E").as_deref(), Some("plan e"));
+    }
+
+    #[test]
+    fn a_flat_number_splits_into_unit_and_building() {
+        assert_eq!(split_flat_number("10/1367"), Some(("10", "1367")));
+        assert_eq!(split_flat_number("3/12A"), Some(("3", "12A")));
+        for number in ["10/A", "12 1/2", "12-14/3", "1/2/34", "12", "/12"] {
+            assert_eq!(split_flat_number(number), None, "{number}");
+        }
     }
 
     #[test]
