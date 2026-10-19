@@ -45,7 +45,7 @@ use super::types::{Label, Tagged, Tagger};
 use crate::{
     container::Container,
     pack::resolve_pack_path,
-    text_index::{expand_address_abbreviations, expand_final_direction},
+    text_index::{expand_address_abbreviations, expand_final_direction, push_folded},
 };
 
 /// The longest span looked up as one name.
@@ -148,9 +148,7 @@ impl Tokens {
         let mut gap = Gap::None;
         for character in text.chars() {
             if character.is_alphanumeric() {
-                for folded in character.to_lowercase() {
-                    word.push(folded);
-                }
+                push_folded(&mut word, character);
                 continue;
             }
             if !word.is_empty() {

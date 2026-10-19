@@ -298,9 +298,9 @@ mod tests {
 
     #[test]
     fn a_row_without_separators_is_one_part() {
-        let row = TaggedRow::parse_line("de\tde\tmünchen/locality 80331/postcode").expect("row");
+        let row = TaggedRow::parse_line("de\tde\tmunchen/locality 80331/postcode").expect("row");
         assert!(row.breaks.is_empty());
-        assert_eq!(row.query(), "münchen 80331");
+        assert_eq!(row.query(), "munchen 80331");
     }
 
     #[test]

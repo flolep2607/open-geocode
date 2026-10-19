@@ -23,6 +23,8 @@ use tantivy::{
     merge_policy::NoMergePolicy,
     schema::{FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions},
 };
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+use unicode_script::{Script, UnicodeScript};
 
 use crate::{
     container::{self, Bytes, Container},
@@ -38,7 +40,7 @@ use crate::{
 };
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
-pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 10;
+pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 11;
 /// Postcode data within this radius describes where a record is: a record
 /// that states no postcode is ranked by the nearest postcode centroid within
 /// it, and the batch check compares the postcode areas within it.
@@ -950,14 +952,17 @@ fn add_normalized_text_if_present(
     }
 }
 
+/// Text as the index and every query read it: lower case, words split at
+/// anything that is not a letter or digit, and Latin letters without their
+/// accents ("Taupō" is "taupo", "Zürich" "zurich"), so an address typed
+/// without them finds the place that has them. Other scripts keep their marks:
+/// a kana's dakuten is a different kana.
 pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
     let mut normalized = String::with_capacity(value.len());
     let mut previous_was_space = true;
     for character in value.chars() {
         if character.is_alphanumeric() {
-            for folded in character.to_lowercase() {
-                normalized.push(folded);
-            }
+            push_folded(&mut normalized, character);
             previous_was_space = false;
         } else if !previous_was_space {
             normalized.push(' ');
@@ -969,6 +974,22 @@ pub(crate) fn normalize_index_text(value: &str) -> Option<String> {
         None
     } else {
         Some(normalized)
+    }
+}
+
+/// Append a letter or digit as the index reads it: lower case, without the
+/// accents of a Latin letter. The parser splits queries with it too, so its
+/// words are those of [`normalize_index_text`].
+pub(crate) fn push_folded(out: &mut String, character: char) {
+    if character.is_ascii() || character.script() != Script::Latin {
+        out.extend(character.to_lowercase());
+    } else {
+        for part in std::iter::once(character)
+            .nfd()
+            .filter(|part| !is_combining_mark(*part))
+        {
+            out.extend(part.to_lowercase());
+        }
     }
 }
 
@@ -1231,6 +1252,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn normalization_takes_the_accents_off_latin_letters_only() {
+        for (text, expected) in [
+            ("Taupō", "taupo"),
+            ("Kumeū, ŌTAKI", "kumeu otaki"),
+            ("Zürich Łódź", "zurich łodz"),
+            ("Saint-Léger", "saint leger"),
+            // Another script's marks change the letter: が is not か.
+            ("がっこう", "がっこう"),
+            ("Москва", "москва"),
+        ] {
+            assert_eq!(
+                normalize_index_text(text).as_deref(),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn projects_address_fields_for_search() {

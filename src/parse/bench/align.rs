@@ -231,7 +231,7 @@ mod tests {
         .expect("tokens");
         assert_eq!(
             row.to_line(),
-            "pl\tpl\tsmętna/street 8/house_number , pl/postcode 31/postcode 343/postcode kraków/locality"
+            "pl\tpl\tsmetna/street 8/house_number , pl/postcode 31/postcode 343/postcode krakow/locality"
         );
     }
 
@@ -248,12 +248,12 @@ mod tests {
 
     #[test]
     fn tokens_are_normalized_until_a_second_pass_changes_nothing() {
-        // Lowercased, "İ" is "i" and a combining dot, which one more pass of
-        // the index normalization splits off.
+        // Lowercased, "İ" is "i" and a combining dot, which a second pass of
+        // the index normalization drops.
         let row = normalize_raw_line("tr\tch\tİsviçre/country", Scheme::Libpostal)
             .expect("row")
             .expect("tokens");
-        assert_eq!(row.to_line(), "tr\tch\ti/country sviçre/country");
+        assert_eq!(row.to_line(), "tr\tch\tisvicre/country");
         assert!(TaggedRow::parse_line(&row.to_line()).is_ok());
     }
 

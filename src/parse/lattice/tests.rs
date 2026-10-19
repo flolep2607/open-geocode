@@ -86,6 +86,20 @@ fn tokens_are_the_index_words_with_the_field_breaks_between_them() {
 }
 
 #[test]
+fn tokens_read_latin_letters_without_their_accents_like_the_index() {
+    let text = "12 Taupō Rd, Wānaka; Zürich Łódź がっこう";
+    let tokens = Tokens::new(text);
+    assert_eq!(
+        tokens.words,
+        ["12", "taupo", "rd", "wanaka", "zurich", "łodz", "がっこう"]
+    );
+    assert_eq!(
+        tokens.words.join(" "),
+        crate::text_index::normalize_index_text(text).unwrap()
+    );
+}
+
+#[test]
 fn the_lattice_has_every_token_and_the_spans_the_dictionaries_know() {
     let tagger = tagger();
     let tokens = Tokens::new("670 king st w toronto on m5v 1m9");

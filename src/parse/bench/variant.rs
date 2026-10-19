@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    const LINE: &str = "de\tde\tmanosquer/street straße/street 12/house_number , 80331/postcode münchen/locality , deutschland/country";
+    const LINE: &str = "de\tde\tmanosquer/street straße/street 12/house_number , 80331/postcode munchen/locality , deutschland/country";
 
     #[test]
     fn as_is_keeps_the_commas_and_stripped_drops_them() {
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(stripped.tokens, gold.tokens);
         assert_eq!(
             stripped.query(),
-            "manosquer straße 12 80331 münchen deutschland"
+            "manosquer straße 12 80331 munchen deutschland"
         );
     }
 
