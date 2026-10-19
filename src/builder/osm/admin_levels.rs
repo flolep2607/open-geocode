@@ -186,6 +186,7 @@ pub(super) fn object_key((kind, id): (OsmObjectType, i64)) -> String {
         OsmObjectType::Node => "node",
         OsmObjectType::Way => "way",
         OsmObjectType::Relation => "relation",
+        OsmObjectType::Row => "row",
     };
     format!("{kind}:{id}")
 }

@@ -17,7 +17,7 @@ use open_geocode::{
         BenchmarkFixture, PackBenchmarkOptions, PoiFixtureOptions, benchmark_pack,
         sample_poi_fixture,
     },
-    builder::{BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
+    builder::{AddressFile, BuildOsmOptions, build_planned_osm_pack, plan_osm_build},
     geocode_bench::{GeocodeBenchmarkOptions, benchmark_geocode},
     pack::{Reader, RecordId},
     parse::{
@@ -120,6 +120,14 @@ enum PackCommand {
         /// disk for the input.
         #[arg(long)]
         force: bool,
+
+        /// OpenAddresses-format CSV of extra addresses, as `dataset=path` or
+        /// `path` (the file stem names the dataset). LON, LAT, NUMBER and
+        /// STREET columns are required; UNIT, CITY, REGION and POSTCODE are
+        /// read when present. A row's record id is `dataset:row`. Repeat for
+        /// several files.
+        #[arg(long = "addresses", value_name = "[DATASET=]PATH")]
+        addresses: Vec<AddressFile>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -476,6 +484,7 @@ async fn main() -> Result<()> {
             memory_budget_mb,
             scratch_dir,
             force,
+            addresses,
         }) => {
             resources::opt_out_of_power_throttling();
             let options = BuildOsmOptions {
@@ -487,6 +496,7 @@ async fn main() -> Result<()> {
                     .context("--memory-budget-mb is larger than this machine can address")?,
                 scratch_dir,
                 force,
+                addresses,
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;

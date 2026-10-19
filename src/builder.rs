@@ -4,7 +4,8 @@ pub mod progress;
 pub mod report;
 
 pub use osm::{
-    BuildOsmOptions, build_osm_pack, build_planned_osm_pack, plan_osm_build, replication_timestamp,
+    AddressFile, BuildOsmOptions, build_osm_pack, build_planned_osm_pack, plan_osm_build,
+    replication_timestamp,
 };
 pub use plan::{BuildPlan, plan_build};
 pub use progress::{BuildCancelled, BuildObserver, BuildStage, StageUnit, TerminalObserver};

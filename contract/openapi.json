@@ -318,7 +318,8 @@
         "enum": [
           "node",
           "way",
-          "relation"
+          "relation",
+          "row"
         ],
         "type": "string"
       },

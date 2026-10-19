@@ -40,6 +40,7 @@ mod emitted;
 mod geometry;
 mod interpolation;
 mod nodes;
+mod open_addresses;
 mod pbf;
 mod place;
 mod poi;
@@ -89,6 +90,8 @@ use boundary::{BoundaryIndex, ContextOrigin, Vertex, build_boundaries, record_co
 use emit::{FeatureOutput, emit_features};
 use emitted::Emitted;
 use nodes::join_nodes;
+pub use open_addresses::AddressFile;
+use open_addresses::{import_addresses, validate};
 pub use pbf::replication_timestamp;
 use pbf::{for_each_block, input_bytes};
 use postcode::PostcodeAccumulator;
@@ -118,6 +121,9 @@ pub struct BuildOsmOptions {
     /// What the inputs are, for example region ids, kept in the build
     /// report. One per input, in the same order.
     pub input_sources: Vec<String>,
+    /// OpenAddresses-format CSV files of extra addresses, added next to the
+    /// OSM ones.
+    pub addresses: Vec<AddressFile>,
     /// Told about each stage as it starts, advances and finishes, and about
     /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
@@ -135,6 +141,7 @@ impl Default for BuildOsmOptions {
             scratch_dir: None,
             force: false,
             input_sources: Vec::new(),
+            addresses: Vec::new(),
             observer: Arc::new(TerminalObserver::new()),
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -151,6 +158,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("scratch_dir", &self.scratch_dir)
             .field("force", &self.force)
             .field("input_sources", &self.input_sources)
+            .field("addresses", &self.addresses)
             .field("cancel", &self.cancel)
             .finish_non_exhaustive()
     }
@@ -172,6 +180,7 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
             )));
         }
     }
+    validate(&options.addresses)?;
     let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
     // The passes run per input but the sorters, the heap the boundary stage
     // holds and the Pack are shared, so the build is sized to every input
@@ -413,6 +422,17 @@ pub fn build_planned_osm_pack(options: BuildOsmOptions, plan: BuildPlan) -> Resu
             member_vertices.insert(way_id, line);
         }
     }
+
+    // Imported rows join the OSM addresses before boundaries and postcode
+    // centroids are derived from them.
+    let phase = Instant::now();
+    for file in &options.addresses {
+        import_addresses(file, |emitted| {
+            progress.check()?;
+            build.absorb(emitted)
+        })?;
+    }
+    build.report.phases.address_import_ms = phase.elapsed().as_millis();
 
     // Admin boundaries, their place records and postcode centroids. Every
     // input has been read, so a relation whose ways span two extracts is
@@ -785,7 +805,7 @@ mod tests {
     use crate::{
         builder::progress::StageUnit,
         pack::{PointPrecision, Reader},
-        record::Record,
+        record::{OsmObjectType, Record, SourceProvenance},
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
     };
@@ -1648,6 +1668,121 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:node:2001"));
         assert_eq!(result.label, "123 King Street West, M5V 1A1");
         assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+    }
+
+    #[test]
+    fn imports_csv_addresses_beside_osm_ones() {
+        let dir = temp_dir("csv");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let csv = dir.join("rows.csv");
+        fs::write(
+            &csv,
+            "LON,LAT,NUMBER,STREET,UNIT,CITY,DISTRICT,REGION,POSTCODE,HASH,ID\n\
+             -79.41,43.605,77,SPADINA AVENUE,,Toronto,,ON,M5T 9Z9,h1,a\n\
+             -79.411,43.605,,SPADINA AVENUE,,,,,,h2,b\n\
+             -79.412,43.606,5,SPADINA AVENUE,2,,,,,h3,c\n",
+        )
+        .expect("csv");
+        let build_with_rows = |root: PathBuf, memory_budget_bytes| {
+            build_osm_pack(BuildOsmOptions {
+                inputs: vec![input.clone()],
+                pack: root,
+                memory_budget_bytes,
+                addresses: vec![AddressFile {
+                    dataset: "oa".to_string(),
+                    path: csv.clone(),
+                }],
+                ..BuildOsmOptions::default()
+            })
+            .expect("build")
+        };
+        let report = build_with_rows(dir.join("pack"), None);
+
+        assert_eq!(report.scanned.address_rows, 3);
+        assert_eq!(report.accepted.imported_addresses, 2);
+        assert_eq!(report.rejected.by_reason["missing_housenumber"], 1);
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let counts = &reader.manifest().layer_counts;
+        assert_eq!(counts["address"], 7, "five from OSM and two imported rows");
+        assert_eq!(
+            counts["postcode"], 2,
+            "the imported postcode adds a centroid"
+        );
+
+        let row = reader
+            .find_by_source_id("oa:1")
+            .expect("lookup")
+            .expect("imported row 1");
+        let summary = reader.record_summary(row).expect("summary");
+        assert_eq!(summary.source.dataset, "oa");
+        assert_eq!(summary.source.object_type, Some(OsmObjectType::Row));
+        assert_eq!(summary.source.object_id, Some(1));
+        let Record::Address(address) = reader.records().record(row).expect("record") else {
+            panic!("an address");
+        };
+        assert_eq!(address.source, SourceProvenance::row("oa", 1));
+        assert_eq!(address.address.postcode.as_deref(), Some("M5T 9Z9"));
+        let context = reader
+            .boundary_context(row)
+            .expect("context")
+            .expect("has context");
+        let locality = context.admin_context.locality_record_id.expect("locality");
+        assert_eq!(
+            reader
+                .context_record(locality)
+                .expect("record")
+                .expect("context")
+                .name,
+            "Toronto"
+        );
+
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let hits = searcher
+            .search(TextSearchOptions {
+                query: "77 spadina avenue".into(),
+                limit: 1,
+                layer: Some("address".into()),
+                countries: Vec::new(),
+            })
+            .expect("search");
+        assert_eq!(hits[0].record.id, "oa:1");
+        assert_eq!(
+            hits[0].record.label,
+            "77 SPADINA AVENUE, Toronto, ON, M5T 9Z9"
+        );
+
+        // Rows survive the spill files and the same boundary-context path.
+        build_with_rows(dir.join("spilled"), Some(4));
+        let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
+        assert_eq!(
+            reader.manifest().record_count,
+            spilled.manifest().record_count
+        );
+        for id in 0..reader.manifest().record_count {
+            assert_eq!(
+                reader.record_json(id).expect("record"),
+                spilled.record_json(id).expect("spilled record")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_missing_address_file() {
+        let dir = temp_dir("csv-missing");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let error = build_osm_pack(BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: vec![AddressFile {
+                dataset: "oa".to_string(),
+                path: dir.join("absent.csv"),
+            }],
+            ..BuildOsmOptions::default()
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::BadInput(_)), "{error}");
     }
 
     #[test]

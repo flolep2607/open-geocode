@@ -17,7 +17,10 @@
 //! body  tag u8        layer (4 bits) | centroid (1) | line geometry (1) | source kind (2)
 //!       dlon, dlat    zigzag varints from the block base
 //!       context       varint, 0 = none, else (tuple_id + 1) << 1 | ambiguous
-//!       source        zigzag OSM object id, or the address count for postcodes
+//!       source        zigzag OSM object id, or the address count for postcodes;
+//!                     an address with the derived kind is an imported row: its
+//!                     value is the row number and its dataset name follows the
+//!                     address fields
 //!       fields        per layer, strings as varint ids local to the record's segment;
 //!                     a street's, place's or POI's alternate names follow its name
 //!                     (and category or place type) as a varint count and ids, and
@@ -65,6 +68,10 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 6;
+/// Version of a store holding imported address rows. Readers of the other
+/// version refuse such a Pack when they open it, instead of failing on the
+/// first imported row a query reaches.
+pub const RECORDS_VERSION_IMPORTED: u32 = 7;
 
 pub const BLOCK_RECORDS: u64 = 64;
 /// Approximate bytes a dictionary entry costs beyond its text: the boxed
@@ -208,6 +215,12 @@ impl Header {
         }
     }
 
+    /// An address row imported from a file, not an OSM object. Derived is
+    /// otherwise postcode-only, so a Pack without imports never holds this.
+    fn imported(&self) -> bool {
+        self.source_kind == SourceKind::Derived && self.layer == Layer::Address
+    }
+
     fn osm_source(&self) -> Result<(OsmObjectType, i64)> {
         let object_type = match self.source_kind {
             SourceKind::Node => OsmObjectType::Node,
@@ -223,6 +236,16 @@ impl Header {
     }
 
     fn source(&self) -> Result<Source> {
+        if self.imported() {
+            // The dataset name follows the address fields; the caller fills it in.
+            return Ok(Source {
+                dataset: String::new(),
+                object_type: Some(OsmObjectType::Row),
+                object_id: Some(crate::util::codec::unzigzag(self.source_value)),
+                derived_from: None,
+                record_count: None,
+            });
+        }
         if self.source_kind == SourceKind::Derived {
             return Ok(Source {
                 dataset: "osm".into(),
@@ -242,7 +265,13 @@ impl Header {
         })
     }
 
-    fn provenance(&self) -> Result<SourceProvenance> {
+    fn provenance(&self, dataset: Option<&str>) -> Result<SourceProvenance> {
+        if let Some(dataset) = dataset {
+            return Ok(SourceProvenance::row(
+                dataset,
+                crate::util::codec::unzigzag(self.source_value),
+            ));
+        }
         let (object_type, object_id) = self.osm_source()?;
         Ok(SourceProvenance::osm(object_type, object_id))
     }
@@ -261,6 +290,8 @@ pub struct Writer {
     block_ends: Vec<u32>,
     block_base: (i32, i32),
     record_count: u64,
+    /// Whether any record is an imported address row.
+    imported: bool,
     strings: StringTable,
     body: Vec<u8>,
 }
@@ -346,6 +377,7 @@ impl Writer {
             block_ends: Vec::new(),
             block_base: (0, 0),
             record_count: 0,
+            imported: false,
             strings: StringTable {
                 ids: HashMap::new(),
                 memory: Reservation::empty(budget),
@@ -455,7 +487,13 @@ impl Writer {
         put_u64(out, source_value);
 
         match record {
-            Record::Address(record) => self.put_address(out, &record.address)?,
+            Record::Address(record) => {
+                self.put_address(out, &record.address)?;
+                if record.source.object_type == OsmObjectType::Row {
+                    self.imported = true;
+                    put_u64(out, u64::from(self.strings.id(&record.source.dataset)?));
+                }
+            }
             Record::Poi(record) => {
                 put_u64(out, u64::from(self.strings.id(&record.name)?));
                 put_u64(out, u64::from(self.strings.id(&record.category)?));
@@ -588,16 +626,21 @@ impl Writer {
         self.strings.bytes.flush()?;
         self.strings.ends.flush()?;
 
-        pack.begin(SECTION_INDEX, RECORDS_VERSION)?;
+        let version = if self.imported {
+            RECORDS_VERSION_IMPORTED
+        } else {
+            RECORDS_VERSION
+        };
+        pack.begin(SECTION_INDEX, version)?;
         pack.write_all(&self.record_count.to_le_bytes())?;
         std::io::copy(&mut File::open(&self.block_offsets_path)?, pack)?;
         pack.write_all(&self.blocks_len.to_le_bytes())?;
         pack.end()?;
 
-        pack.add_file(SECTION_BLOCKS, RECORDS_VERSION, &self.blocks_path)?;
+        pack.add_file(SECTION_BLOCKS, version, &self.blocks_path)?;
 
         let strings = &self.strings;
-        pack.begin(SECTION_STRINGS, RECORDS_VERSION)?;
+        pack.begin(SECTION_STRINGS, version)?;
         pack.write_all(&(strings.segments.len() as u64).to_le_bytes())?;
         for (first_record, first_string) in &strings.segments {
             pack.write_all(&first_record.to_le_bytes())?;
@@ -625,9 +668,13 @@ pub struct Reader {
 
 impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
-        let index = container.section(SECTION_INDEX, RECORDS_VERSION)?;
-        let blocks = container.section(SECTION_BLOCKS, RECORDS_VERSION)?;
-        let strings = container.section(SECTION_STRINGS, RECORDS_VERSION)?;
+        let version = match container.sections().get(SECTION_INDEX) {
+            Some(info) if info.version == RECORDS_VERSION_IMPORTED => RECORDS_VERSION_IMPORTED,
+            _ => RECORDS_VERSION,
+        };
+        let index = container.section(SECTION_INDEX, version)?;
+        let blocks = container.section(SECTION_BLOCKS, version)?;
+        let strings = container.section(SECTION_STRINGS, version)?;
 
         let record_count =
             read_u64_le(&index, 0).ok_or(Error::Decode("records index is truncated"))?;
@@ -710,11 +757,12 @@ impl Reader {
         Ok(match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
+                let dataset = self.imported_dataset(&header, &mut fields)?;
                 Record::Address(AddressRecord {
                     address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
-                    source: header.provenance()?,
+                    source: header.provenance(dataset)?,
                 })
             }
             Layer::Poi => {
@@ -727,7 +775,7 @@ impl Reader {
                     address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
-                    source: header.provenance()?,
+                    source: header.provenance(None)?,
                 })
             }
             Layer::Interpolation => {
@@ -739,7 +787,7 @@ impl Reader {
                     anchor_node_ids,
                     geometry: geometry(&mut fields)?,
                     representative_point: [header.lon(), header.lat()],
-                    source: header.provenance()?,
+                    source: header.provenance(None)?,
                 })
             }
             Layer::Street => Record::Street(StreetRecord {
@@ -747,7 +795,7 @@ impl Reader {
                 alt_names: self.string_list(header.strings, &mut fields)?,
                 geometry: geometry(&mut fields)?,
                 representative_point: [header.lon(), header.lat()],
-                source: header.provenance()?,
+                source: header.provenance(None)?,
             }),
             Layer::Postcode => Record::Postcode(PostcodeRecord {
                 postcode: self.string_field(header.strings, &mut fields)?.to_string(),
@@ -763,7 +811,7 @@ impl Reader {
                         place_type: self.string_field(header.strings, &mut fields)?.to_string(),
                         alt_names: self.string_list(header.strings, &mut fields)?,
                         geometry: geometry(&mut fields)?,
-                        source: header.provenance()?,
+                        source: header.provenance(None)?,
                     },
                 )
             }
@@ -774,16 +822,26 @@ impl Reader {
     /// geometry.
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let (header, mut fields) = self.body(id)?;
-        let source = header.source()?;
+        let mut source = header.source()?;
         let mut category = None;
         let mut stated = Address::default();
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
                 let address = self.address_components(header.strings, &mut fields)?;
-                let (object_type, object_id) = header.osm_source()?;
+                let id = match self.imported_dataset(&header, &mut fields)? {
+                    Some(dataset) => {
+                        let provenance = header.provenance(Some(dataset))?;
+                        source.dataset = provenance.dataset.clone();
+                        crate::labels::source_record_id(&provenance)
+                    }
+                    None => {
+                        let (object_type, object_id) = header.osm_source()?;
+                        crate::labels::osm_record_id(object_type, object_id)
+                    }
+                };
                 stated = Address::from(&address);
                 (
-                    crate::labels::osm_record_id(object_type, object_id),
+                    id,
                     crate::labels::address_name(&address),
                     crate::labels::address_label(&address),
                 )
@@ -1138,6 +1196,14 @@ impl Reader {
         })
     }
 
+    /// The dataset name stored after the fields of an imported address row.
+    fn imported_dataset(&self, header: &Header, fields: &mut &[u8]) -> Result<Option<&str>> {
+        if !header.imported() {
+            return Ok(None);
+        }
+        self.string_field(header.strings, fields).map(Some)
+    }
+
     fn poi_fields(
         &self,
         strings: StringSegment,
@@ -1188,6 +1254,7 @@ impl Reader {
         match header.layer {
             Layer::Address => {
                 self.address_components(header.strings, fields)?;
+                self.imported_dataset(header, fields)?;
             }
             Layer::Poi => {
                 self.poi_fields(header.strings, fields)?;
@@ -1247,6 +1314,7 @@ fn osm_source(source: &SourceProvenance) -> (SourceKind, u64) {
         OsmObjectType::Node => SourceKind::Node,
         OsmObjectType::Way => SourceKind::Way,
         OsmObjectType::Relation => SourceKind::Relation,
+        OsmObjectType::Row => SourceKind::Derived,
     };
     (kind, crate::util::codec::zigzag(source.object_id))
 }
@@ -1431,6 +1499,11 @@ mod tests {
     }
 
     fn write_store(records: &[Record], contexts: &[Option<ContextRef>]) -> Reader {
+        Reader::open(&Container::open(write_container(records, contexts)).expect("open"))
+            .expect("reader")
+    }
+
+    fn write_container(records: &[Record], contexts: &[Option<ContextRef>]) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
@@ -1445,7 +1518,45 @@ mod tests {
         let mut pack = container::Writer::create(&path).expect("pack");
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
-        Reader::open(&Container::open(&path).expect("open")).expect("reader")
+        path
+    }
+
+    #[test]
+    fn imported_rows_round_trip_and_bump_the_section_version() {
+        let mut records = sample_records();
+        let version = |path: &std::path::Path| {
+            Container::open(path).expect("open").sections()[SECTION_INDEX].version
+        };
+        assert_eq!(
+            version(&write_container(&records, &[])),
+            RECORDS_VERSION,
+            "a store without imported rows stays as it was"
+        );
+
+        let row = Record::Address(AddressRecord {
+            address: AddressComponents {
+                areas: Vec::new(),
+                number: "7".into(),
+                street: Some("BARRINGER STREET".into()),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: None,
+                country: None,
+            },
+            geometry: point_geometry(172.6, -43.5),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::row("linz", 42),
+        });
+        records.push(row.clone());
+        let path = write_container(&records, &[]);
+        assert_eq!(version(&path), RECORDS_VERSION_IMPORTED);
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
+        let id = records.len() as u64 - 1;
+        assert_eq!(reader.record(id).expect("record"), row);
+        assert_eq!(reader.summary(id).expect("summary").id, "linz:42");
+        assert_eq!(reader.summary(id).expect("summary").source.dataset, "linz");
     }
 
     #[test]

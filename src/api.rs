@@ -226,7 +226,7 @@ impl Accuracy {
             records::PointPrecision::RepresentativePoint => Self::Street,
             records::PointPrecision::Centroid => match source.object_type {
                 Some(OsmObjectType::Way | OsmObjectType::Relation) => Self::Centroid,
-                Some(OsmObjectType::Node) | None => Self::Approximate,
+                Some(OsmObjectType::Node | OsmObjectType::Row) | None => Self::Approximate,
             },
         }
     }
