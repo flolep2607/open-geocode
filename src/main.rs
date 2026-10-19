@@ -431,6 +431,11 @@ struct BatchGeocodeArgs {
     #[arg(long)]
     layer: Option<String>,
 
+    /// Resolve a row whose house number is not in the data to its street in the row's
+    /// locality or postcode. The point is on the street, reported as geocode_layer street.
+    #[arg(long)]
+    street_fallback: bool,
+
     /// Number of engine candidates to inspect per query. Use 0 for the engine default.
     #[arg(long, default_value_t = 10)]
     limit: usize,
@@ -897,6 +902,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field,
         postcode_field,
         layer,
+        street_fallback,
         limit,
         lat_column,
         lon_column,
@@ -927,6 +933,7 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
         region_field: region_field.map(Column::Named),
         postcode_field: postcode_field.map(Column::Named),
         layer,
+        street_fallback,
         limit,
         lat_column,
         lon_column,

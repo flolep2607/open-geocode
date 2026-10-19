@@ -170,6 +170,8 @@ pub(crate) struct GeocodeParams {
     layer: Option<String>,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Option<String>,
+    #[serde(default)]
+    street_fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,6 +464,12 @@ pub(crate) async fn autocomplete(
                         rejected; one the Pack does not cover simply matches \
                         nothing.",
          example = "NZ,AU"),
+        ("street_fallback" = Option<bool>, Query,
+         description = "When the house number is not in the data, answer with \
+                        the street instead: a point on it, in a feature of \
+                        layer `street`. Needs `locality` or `postcode` to pick \
+                        the street among namesakes. Off by default.",
+         example = true),
     ),
     responses(
         (status = 200,
@@ -504,6 +512,7 @@ pub(crate) async fn geocode(
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
         countries,
+        street_fallback: params.street_fallback,
     };
     let collection = blocking(move || {
         let found = state.searcher.geocode_address(options)?;

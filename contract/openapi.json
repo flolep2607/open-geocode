@@ -750,6 +750,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "When the house number is not in the data, answer with the street instead: a point on it, in a feature of layer `street`. Needs `locality` or `postcode` to pick the street among namesakes. Off by default.",
+            "example": true,
+            "in": "query",
+            "name": "street_fallback",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

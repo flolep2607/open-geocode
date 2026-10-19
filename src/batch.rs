@@ -53,6 +53,9 @@ pub struct GeocodeOptions {
     pub region_field: Option<Column>,
     pub postcode_field: Option<Column>,
     pub layer: Option<String>,
+    /// Resolve a row whose house number is not in the data to its street,
+    /// reported with `geocode_layer` `street`.
+    pub street_fallback: bool,
     pub limit: usize,
     pub lat_column: String,
     pub lon_column: String,
@@ -92,6 +95,7 @@ impl Default for GeocodeOptions {
             region_field: None,
             postcode_field: None,
             layer: None,
+            street_fallback: false,
             limit: 10,
             lat_column: "lat".to_string(),
             lon_column: "lon".to_string(),
@@ -605,6 +609,7 @@ fn geocode_row(
             limit: options.limit,
             layer: options.layer.clone(),
             countries: Vec::new(),
+            street_fallback: options.street_fallback,
         })?;
         tried_queries.push(address);
         if let Some(response) = response {
