@@ -3,6 +3,7 @@ name: packs
 # Builds one Pack per country from its Geofabrik extract with the published image, and uploads it
 # to the rolling `packs-latest` release. Packs are built from OpenStreetMap data and published under
 # the ODbL: (c) OpenStreetMap contributors, https://www.openstreetmap.org/copyright.
+# Official address attribution: Luxembourg BD-Adresses is CC0; swisstopo: Source: Federal Office of Topography swisstopo, https://www.swisstopo.admin.ch/ogd-conditions.
 on:
   schedule:
     - cron: "0 3 * * 1"  # Mondays 03:00 UTC: Geofabrik extracts are daily
@@ -66,12 +67,42 @@ jobs:
           test "$want" = "$got" || { echo "checksum mismatch: $want != $got"; exit 1; }
           echo "NAME=$name" >> "$GITHUB_ENV"
           ls -la
+      - name: Download and convert official addresses
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          addresses=''
+          case "$REGION" in
+            europe/luxembourg)
+              curl -fsSL --retry 5 -o work/official-addresses.csv \
+                https://data.public.lu/fr/datasets/r/5cadc5b8-6a7d-4283-87bc-f9e58dd771f7
+              python3 scripts/official_addresses.py lu work/official-addresses.csv work/addresses.csv
+              addresses="bd-adresses-lu=/work/addresses.csv"
+              ;;
+            europe/switzerland)
+              curl -fsSL --retry 5 -o work/official-addresses.zip \
+                https://data.geo.admin.ch/ch.swisstopo.amtliches-gebaeudeadressverzeichnis/amtliches-gebaeudeadressverzeichnis_ch/amtliches-gebaeudeadressverzeichnis_ch_2056.csv.zip
+              python3 scripts/official_addresses.py ch work/official-addresses.zip work/addresses.csv
+              addresses="swisstopo-ch=/work/addresses.csv"
+              ;;
+            europe/liechtenstein)
+              curl -fsSL --retry 5 -o work/official-addresses.zip \
+                https://data.geo.admin.ch/ch.swisstopo.amtliches-gebaeudeadressverzeichnis/amtliches-gebaeudeadressverzeichnis_li/amtliches-gebaeudeadressverzeichnis_li_2056.csv.zip
+              python3 scripts/official_addresses.py li work/official-addresses.zip work/addresses.csv
+              addresses="swisstopo-li=/work/addresses.csv"
+              ;;
+          esac
+          echo "ADDRESSES=$addresses" >> "$GITHUB_ENV"
       - name: Build the pack
         run: |
           args=(pack build --input "/work/$NAME.osm.pbf" --pack "/work/pack-$NAME" --memory-budget-mb 8192)
+          if [ -n "$ADDRESSES" ]; then
+            args+=(--addresses "$ADDRESSES")
+          fi
           docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/work:/work" ghcr.io/${{ github.repository_owner }}/open-geocode:latest \
             "${args[@]}"
           rm "work/$NAME.osm.pbf"
+          rm -f work/official-addresses.csv work/official-addresses.zip work/addresses.csv
           pack=$(find "work/pack-$NAME/generations" -name pack.ogp | head -1)
           mv "$pack" "work/$NAME.ogp"
           ls -la work
