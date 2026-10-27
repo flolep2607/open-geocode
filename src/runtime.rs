@@ -243,6 +243,26 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     axum::serve(listener, app).await.map_err(Error::from)
 }
 
+/// Logs for a server run, on stderr, filtered by `RUST_LOG`
+/// (default `info`): text on a terminal, else JSON lines like the error log's,
+/// for a container's log collector. The other commands keep their plain stdout
+/// output, and the `og` interface its screen.
+pub fn init_logs() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        logs.init();
+    } else {
+        logs.json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .init();
+    }
+}
+
 /// Assemble the public-demo router with its boundary policy: method-restricted
 /// routes (ADR 0017 Decision 27), Problem Details 404/405 fallbacks
 /// (Decisions 27, 37), and request-id propagation (Decision 30). The basemap is
@@ -321,11 +341,12 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         ),
         None => app.fallback(method::not_found),
     };
-    app.layer(middleware::from_fn_with_state(
-        error_log,
-        request_id::propagate,
-    ))
-    .with_state(state)
+    app.layer(request_id::trace_layer())
+        .layer(middleware::from_fn_with_state(
+            error_log,
+            request_id::propagate,
+        ))
+        .with_state(state)
 }
 
 /// A GET-only route that also rejects HEAD with 405, defeating axum's default
