@@ -116,12 +116,19 @@ og serve canada-ontario
 ```
 
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
-The server logs one line per request to stderr, with its request id, status and latency; `RUST_LOG` sets the level (default `info`, e.g. `RUST_LOG=open_geocode=debug,info`), and off a terminal the lines are JSON.
-`GET /version` returns the server version and the Pack it serves: content id, schema version, build time and record counts.
-`open-geocode serve --metrics` adds `GET /metrics`, Prometheus text: requests by route template, method and status, latency, in-flight requests, batch items and slots in use. Off by default and not in the OpenAPI document; on a public port, keep `/metrics` off the proxy. Routes are labelled by template, so no address or query ever reaches a label.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
+
+### Serving
+
+`open-geocode serve --pack <pack>` (or `og serve`) logs one line per request to stderr, with its request id, status and latency; `RUST_LOG` sets the level (default `info`, e.g. `RUST_LOG=open_geocode=debug,info`), and off a terminal the lines are JSON. The flags below are `open-geocode serve`'s.
+
+- `GET /version` returns the server version and the Pack it serves: content id, schema version, build time and record counts.
+- `--metrics` adds `GET /metrics`, Prometheus text: requests by route template, method and status, latency, in-flight requests, batch items and slots in use. Off by default and not in the OpenAPI document; on a public port, keep `/metrics` off the proxy. Routes are labelled by template, so no address or query ever reaches a label.
+- `--cors-origin <ORIGIN>`: let a browser page on that origin call the API; repeat it, or pass `*` for any. Off by default: no CORS headers.
+- `--cache-max-age <SECS>`: `Cache-Control: public, max-age` and an `ETag` on `/search`, `/autocomplete`, `/geocode` and `/reverse` answers; an `If-None-Match` hit is a `304` that skips the lookup. Default 3600; `0` sends neither. Errors and `/batches` are never cached.
+- Responses over 32 bytes are gzip- or zstd-compressed when `Accept-Encoding` allows it.
 
 ### Docker
 

@@ -35,7 +35,7 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{ServeOptions, init_logs, serve},
+    runtime::{EdgeOptions, ServeOptions, init_logs, serve},
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -95,6 +95,16 @@ enum Commands {
         /// the server's traffic to anyone who can reach the port.
         #[arg(long)]
         metrics: bool,
+
+        /// Origin a browser page may call the API from, `*` for any. Repeat
+        /// for several. Without it no CORS headers are sent.
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
+
+        /// Seconds a client may reuse a lookup answer (`Cache-Control:
+        /// max-age`). 0 sends no cache headers or ETag.
+        #[arg(long, default_value_t = 3600)]
+        cache_max_age: u32,
     },
 }
 
@@ -757,6 +767,8 @@ async fn main() -> Result<()> {
             bind,
             basemap,
             metrics,
+            cors_origins,
+            cache_max_age,
         } => {
             init_logs();
             serve(ServeOptions {
@@ -765,6 +777,10 @@ async fn main() -> Result<()> {
                 bind,
                 basemap: Some(basemap),
                 metrics,
+                edge: EdgeOptions {
+                    cors_origins,
+                    cache_max_age,
+                },
             })
             .await?;
             Ok(())
