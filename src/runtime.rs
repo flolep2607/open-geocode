@@ -287,6 +287,7 @@ pub fn init_logs() {
         logs.json()
             .flatten_event(true)
             .with_current_span(true)
+            .with_span_list(false)
             .init();
     }
 }
