@@ -1047,13 +1047,12 @@ impl<'a> Reading<'a> {
                     continue;
                 }
                 let next = label as usize;
-                let incoming = *sums[span.start][next].get_or_insert_with(|| {
-                    log_sum(
-                        previous_states(span.start).map(|previous| {
+                let incoming =
+                    *sums[span.start][next].get_or_insert_with(|| {
+                        log_sum(previous_states(span.start).map(|previous| {
                             alpha[span.start][previous] + transitions[previous][next]
-                        }),
-                    )
-                });
+                        }))
+                    });
                 let value = incoming + edges[index][next];
                 alpha[span.end][next] = log_add(alpha[span.end][next], value);
             }
