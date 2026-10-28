@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -35,7 +36,10 @@ use open_geocode::{
     },
     resources,
     reverse::{self, PackReverseGeocoder},
-    runtime::{EdgeOptions, ServeOptions, init_logs, serve},
+    runtime::{
+        DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_SHUTDOWN_TIMEOUT_SECS, EdgeOptions, ServeOptions,
+        init_logs, serve,
+    },
     search::{TextSearchOptions, TextSearcher},
 };
 
@@ -105,6 +109,16 @@ enum Commands {
         /// max-age`). 0 sends no cache headers or ETag.
         #[arg(long, default_value_t = 3600)]
         cache_max_age: u32,
+
+        /// Seconds a lookup or QUERY/POST batch may take before it is
+        /// answered 503. 0 for no limit. Does not apply to /batches.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
+        request_timeout: u64,
+
+        /// Seconds to let in-flight requests finish after Ctrl-C or SIGTERM
+        /// before dropping them. 0 drops them at once.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
+        shutdown_timeout: u64,
     },
 }
 
@@ -769,6 +783,8 @@ async fn main() -> Result<()> {
             metrics,
             cors_origins,
             cache_max_age,
+            request_timeout,
+            shutdown_timeout,
         } => {
             init_logs();
             serve(ServeOptions {
@@ -781,6 +797,8 @@ async fn main() -> Result<()> {
                     cors_origins,
                     cache_max_age,
                 },
+                request_timeout: Duration::from_secs(request_timeout),
+                shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
             Ok(())
